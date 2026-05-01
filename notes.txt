@@ -1,0 +1,37 @@
+andrewsusanto@Andrews-MacBook-Pro spire2elo % npx kill-port 8501
+Need to install the following packages:
+kill-port@2.0.1
+Ok to proceed? (y) n'
+
+npm error canceled
+npm error A complete log of this run can be found in: /Users/andrewsusanto/.npm/_logs/2026-05-01T01_15_09_968Z-debug-0.log
+andrewsusanto@Andrews-MacBook-Pro spire2elo % sudo lsof -i :8501
+Password:
+Sorry, try again.
+Password:
+COMMAND     PID          USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+Brave\x20   973 andrewsusanto   27u  IPv6 0xff02823dd64399b3      0t0  TCP localhost:62096->localhost:8501 (ESTABLISHED)
+Python    22141 andrewsusanto    8u  IPv4 0x29caa4d699908c14      0t0  TCP *:8501 (LISTEN)
+Python    22141 andrewsusanto    9u  IPv6 0xbbce56555b61e6a4      0t0  TCP *:8501 (LISTEN)
+Python    22141 andrewsusanto   14u  IPv6 0x412cab87209b7eea      0t0  TCP localhost:8501->localhost:62096 (ESTABLISHED)
+andrewsusanto@Andrews-MacBook-Pro spire2elo % sudo kill 973
+andrewsusanto@Andrews-MacBook-Pro spire2elo % sudo kill -l
+HUP INT QUIT ILL TRAP ABRT EMT FPE KILL BUS SEGV SYS PIPE ALRM TERM URG
+STOP TSTP CONT CHLD TTIN TTOU IO XCPU XFSZ VTALRM PROF WINCH INFO USR1 USR2
+andrewsusanto@Andrews-MacBook-Pro spire2elo % sudo kill 973
+kill: 973: No such process
+andrewsusanto@Andrews-MacBook-Pro spire2elo % sudo lsof -i :8501
+COMMAND     PID          USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+Python    22141 andrewsusanto    8u  IPv4 0x29caa4d699908c14      0t0  TCP *:8501 (LISTEN)
+Python    22141 andrewsusanto    9u  IPv6 0xbbce56555b61e6a4      0t0  TCP *:8501 (LISTEN)
+Python    22141 andrewsusanto   14u  IPv6 0x614d5482a4d852a9      0t0  TCP localhost:8501->localhost:62142 (ESTABLISHED)
+Brave\x20 23364 andrewsusanto   27u  IPv6 0xda4f13402abf4d02      0t0  TCP localhost:62142->localhost:8501 (ESTABLISHED)
+andrewsusanto@Andrews-MacBook-Pro spire2elo % sudo kill 22141
+andrewsusanto@Andrews-MacBook-Pro spire2elo % 
+
+
+
+
+sudo lsof -i :PORTNUMBER
+-- finds activity at localhost port NumberColumn
+sudo kill PID

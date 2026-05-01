@@ -44,6 +44,9 @@ def iter_choice_events(path: Path) -> Iterator[dict]:
     run_won = data.get("win", False)
     run_id = path.stem
 
+    raw_acts = data.get("acts", [])
+    act1_variant = raw_acts[0].removeprefix("ACT.").title() if raw_acts else None
+
     for act_index, act_points in enumerate(data.get("map_point_history", [])):
         act = _act_label(act_index)
 
@@ -74,6 +77,7 @@ def iter_choice_events(path: Path) -> Iterator[dict]:
                     "character": character,
                     "ascension": ascension,
                     "act": act,
+                    "act1_variant": act1_variant if act_index == 0 else None,
                     "floor": floor,
                     "room_type": room_type,
                     "run_won": run_won,

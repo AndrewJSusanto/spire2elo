@@ -8,17 +8,22 @@ st.set_page_config(page_title="Spire2ELO", page_icon="⚔️", layout="wide")
 
 
 @st.cache_data
-def load():
-    events = run_parser.load_all_events()
+def load_raw_events():
+    return run_parser.load_all_events()
+
+
+@st.cache_data
+def compute(act1_variant_filter: str = "All"):
+    events = load_raw_events()
+    if act1_variant_filter != "All":
+        events = [e for e in events
+                  if e["act"] != "Act 1" or e.get("act1_variant") == act1_variant_filter]
     ratings = elo_engine.compute_ratings(events)
     ratings_df = elo_engine.ratings_to_df(ratings)
     counts_df = elo_engine.match_counts(events)
     merged = ratings_df.merge(counts_df, on=["card", "character", "act"], how="left")
     history_df = elo_engine.compute_ratings_history(events)
     return events, merged, history_df
-
-
-events, df, history_df = load()
 
 
 @st.dialog("ELO History", width="large")
@@ -74,36 +79,35 @@ def _style_global(df_in):
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 st.sidebar.title("spire elo")
 
-all_characters = sorted(df[df["card"] != "SKIP"]["character"].unique())
-selected_char = st.sidebar.selectbox("Character", all_characters)
-
 all_acts = ["Act 1", "Act 2", "Act 3"]
 selected_act = st.sidebar.selectbox("Act", all_acts)
+
+act1_variant = "All"
+if selected_act == "Act 1":
+    act1_variant = st.sidebar.radio("Act 1 Variant", ["All", "Overgrowth", "Underdocks"])
+
+events, df, history_df = compute(act1_variant)
+
+all_characters = sorted(df[df["card"] != "SKIP"]["character"].unique())
+selected_char = st.sidebar.selectbox("Character", all_characters)
 
 min_offered = st.sidebar.slider("Min times offered", 1, 30, 5)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown(
-    """
-    <style>
-    .nav-link {
-        display: block;
-        padding: 0.3rem 0;
-        color: inherit;
-        text-decoration: none;
-        font-size: 0.9rem;
-        opacity: 0.85;
-    }
-    .nav-link:hover { opacity: 1; text-decoration: underline; }
-    </style>
-    <a class="nav-link" href="#top">&#8593; Top</a>
-    <a class="nav-link" href="#elo-leaderboard">&#8595; ELO Ratings</a>
-    <a class="nav-link" href="#below-skip-threshold">&#8595; Cards Below SKIP Threshold</a>
-    <a class="nav-link" href="#full-rankings-table">&#8595; Full Rankings Table</a>
-    <a class="nav-link" href="#all-cards-global-rankings">&#8595; All Cards &#8212; Global Rankings</a>
-    """,
-    unsafe_allow_html=True,
-)
+nav_items = [
+    ("↑ Top", "top"),
+    ("Elo Leaderboard", "elo-leaderboard"),
+    ("Cards Below SKIP Threshold", "below-skip-threshold"),
+]
+if selected_act == "Act 1":
+    nav_items.append(("Alternate Act ELO Variance", "alt-act-variance"))
+nav_items += [
+    ("Character Rankings", "full-rankings-table"),
+    ("All Cards — Global", "all-cards-global-rankings"),
+]
+for label, anchor in nav_items:
+    if st.sidebar.button(label, use_container_width=True, key=f"nav_{anchor}"):
+        st.session_state["_scroll_to"] = anchor
 
 # ── Filter ─────────────────────────────────────────────────────────────────────
 view = df[
@@ -129,13 +133,23 @@ col1, col2, col3 = st.columns(3)
 col1.metric("Cards ranked", len(cards_only))
 col2.metric("Total choice events", len([e for e in events
     if e["character"] == selected_char and e["act"] == selected_act]))
-col3.metric(f"{this_skip_id} ELO", skip_elo,
-            help="ELO of the 'skip all' option — cards below this line are being outcompeted by skipping")
+act_num = selected_act.split()[-1]
+col3.markdown(
+    f"""
+    <div style="line-height:1.4">
+        <div style="font-size:0.875rem">
+            <span style="color:{char_hex}">{selected_char.upper()}</span> SKIP ACT{act_num} ELO
+        </div>
+        <div style="font-size:2rem;font-weight:700;letter-spacing:-0.01em">{skip_elo}</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.markdown("---")
 
 # ── ELO leaderboard chart ──────────────────────────────────────────────────────
-st.markdown('<h3 id="elo-leaderboard">ELO Leaderboard</h3>', unsafe_allow_html=True)
+st.markdown(f'<h3 id="elo-leaderboard" style="color:{char_hex}">ELO Leaderboard</h3>', unsafe_allow_html=True)
 st.caption("Click a bar to view that card's ELO history over time.")
 
 n = st.slider("Show top N cards", 10, min(60, len(cards_only)), min(20, len(cards_only)))
@@ -173,8 +187,9 @@ if event.selection.points:
 
 # ── Below SKIP ─────────────────────────────────────────────────────────────────
 st.markdown("---")
+st.markdown('<div id="below-skip-threshold"></div>', unsafe_allow_html=True)
 below_skip = cards_only[cards_only["elo"] < skip_elo]
-st.markdown(f'<h3 id="below-skip-threshold">Below SKIP threshold — {len(below_skip)} cards</h3>', unsafe_allow_html=True)
+st.markdown(f'<h3 style="color:{char_hex}">Below SKIP threshold — {len(below_skip)} cards</h3>', unsafe_allow_html=True)
 st.caption("These cards are losing ELO to skipping. They were consistently passed over even when offered.")
 
 if below_skip.empty:
@@ -199,9 +214,73 @@ else:
         clicked_card = event2.selection.points[0]["x"]
         show_elo_history(clicked_card, selected_char, selected_act, skip_elo, this_skip_id)
 
+# ── Alternate Act ELO Variance ─────────────────────────────────────────────────
+if selected_act == "Act 1":
+    st.markdown("---")
+    st.markdown('<div id="alt-act-variance"></div>', unsafe_allow_html=True)
+    st.markdown(f'<h3 style="color:{char_hex}">Alternate Act ELO Variance</h3>', unsafe_allow_html=True)
+    st.caption("ELO delta between Overgrowth and Underdocks runs (Overgrowth − Underdocks). Positive = favours Overgrowth, negative = favours Underdocks.")
+
+    _, df_og, _ = compute("Overgrowth")
+    _, df_ud, _ = compute("Underdocks")
+
+    OVERGROWTH_COLOR = "#4a8c5c"
+    UNDERDOCKS_COLOR = "#7baabf"
+
+    def _variant_act1(vdf):
+        return vdf[
+            (vdf["character"] == selected_char) &
+            (vdf["act"] == "Act 1") &
+            (~vdf["card"].str.contains("_SKIP_ACT")) &
+            (vdf["times_offered"] >= min_offered)
+        ][["card", "elo"]]
+
+    og_cards = _variant_act1(df_og).rename(columns={"elo": "Overgrowth"})
+    ud_cards = _variant_act1(df_ud).rename(columns={"elo": "Underdocks"})
+
+    variance_df = og_cards.merge(ud_cards, on="card", how="inner")
+    variance_df["delta"] = (variance_df["Overgrowth"] - variance_df["Underdocks"]).round(1)
+    variance_df["abs_delta"] = variance_df["delta"].abs()
+    variance_df["favors"] = (variance_df["delta"] >= 0).map({True: "Overgrowth", False: "Underdocks"})
+
+    order_by = st.radio(
+        "Show cards", ["Greatest Divergence", "Favoring Overgrowth", "Favoring Underdocks"],
+        horizontal=True, key="variance_order",
+    )
+
+    if order_by == "Favoring Overgrowth":
+        plot_df = variance_df[variance_df["delta"] > 0].sort_values("delta", ascending=True)
+    elif order_by == "Favoring Underdocks":
+        plot_df = variance_df[variance_df["delta"] < 0].sort_values("delta", ascending=False)
+    else:
+        plot_df = variance_df.sort_values("abs_delta", ascending=True)
+
+    if plot_df.empty:
+        st.info("No cards meet the current filter criteria for this selection.")
+    else:
+        fig_var = px.bar(
+            plot_df,
+            x="delta", y="card",
+            orientation="h",
+            color="favors",
+            color_discrete_map={"Overgrowth": OVERGROWTH_COLOR, "Underdocks": UNDERDOCKS_COLOR},
+            text="delta",
+            height=max(420, len(plot_df) * 22),
+            labels={"delta": "ELO Delta (Overgrowth − Underdocks)", "card": "", "favors": "Favors"},
+            hover_data={"Overgrowth": True, "Underdocks": True, "abs_delta": False, "favors": False},
+        )
+        fig_var.add_vline(x=0, line_color="gray", line_width=1)
+        fig_var.update_traces(texttemplate="%{text:+.1f}", textposition="outside")
+        fig_var.update_layout(
+            margin=dict(t=20, b=40, l=10),
+            xaxis_title="ELO Delta (Overgrowth − Underdocks)",
+            legend=dict(orientation="h", y=1.02, x=0),
+        )
+        st.plotly_chart(fig_var, use_container_width=True)
+
 # ── Full table ─────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.markdown('<h3 id="full-rankings-table">Full Rankings Table</h3>', unsafe_allow_html=True)
+st.markdown(f'<h3 id="full-rankings-table" style="color:{char_hex}">Full Rankings Table</h3>', unsafe_allow_html=True)
 st.dataframe(
     cards_only[["card", "elo", "times_offered", "times_picked", "pick_rate"]].rename(columns={
         "card": "Card", "elo": "ELO", "times_offered": "Offered",
@@ -228,3 +307,16 @@ for tab, act_label in [(tab1, "Act 1"), (tab2, "Act 2"), (tab3, "Act 3")]:
             .reset_index(drop=True)
         )
         st.dataframe(act_cards.style.apply(_style_global, axis=None).format({"ELO": "{:.1f}"}), use_container_width=True, height=500)
+
+# ── Scroll via JS ───────────────────────────────────────────────────────────────
+if "_scroll_to" in st.session_state:
+    target = st.session_state.pop("_scroll_to")
+    st.components.v1.html(
+        f"""
+        <script>
+            var el = window.parent.document.getElementById('{target}');
+            if (el) el.scrollIntoView({{behavior: 'smooth', block: 'start'}});
+        </script>
+        """,
+        height=0,
+    )
