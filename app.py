@@ -1,20 +1,64 @@
+import hashlib
+
 import streamlit as st
 import plotly.express as px
 import pandas as pd
 import run_parser
 import elo as elo_engine
+import war as war_engine
+from assets import character_icon_uri
 
 st.set_page_config(page_title="Spire2ELO", page_icon="⚔️", layout="wide")
 
 
-@st.cache_data
-def load_raw_events():
+def _source_key() -> str:
+    return st.session_state.get("uploaded_hash", "local")
+
+
+def _get_events_data() -> list:
+    runs = st.session_state.get("uploaded_runs_by_id")
+    if runs:
+        return run_parser.events_from_runs_by_id(runs)
     return run_parser.load_all_events()
 
 
+# ── Sidebar uploader (renders before everything else needs the data) ───────────
+with st.sidebar:
+    st.markdown("### Save data")
+    _uploaded = st.file_uploader(
+        "Upload your zipped `saves/` folder",
+        type=["zip"],
+        help="Zip your Slay the Spire 2 saves folder and drop it here.",
+        key="saves_zip_uploader",
+    )
+    if _uploaded is not None:
+        _new_hash = hashlib.sha1(_uploaded.getvalue()).hexdigest()[:16]
+        if st.session_state.get("uploaded_hash") != _new_hash:
+            with st.spinner("Parsing save data…"):
+                _parsed = run_parser.parse_uploaded_zip(_uploaded.getvalue())
+            st.session_state["uploaded_runs_by_id"] = _parsed["runs_by_id"]
+            st.session_state["uploaded_progress"] = _parsed["progress"]
+            st.session_state["uploaded_hash"] = _new_hash
+            st.rerun()
+    elif st.session_state.get("uploaded_hash"):
+        for _k in ("uploaded_runs_by_id", "uploaded_progress", "uploaded_hash"):
+            st.session_state.pop(_k, None)
+        st.rerun()
+
+    if st.session_state.get("uploaded_hash"):
+        _n = len(st.session_state.get("uploaded_runs_by_id", {}))
+        _has_prog = "✓" if st.session_state.get("uploaded_progress") else "✗"
+        st.caption(f"Uploaded: **{_n}** runs · progress.save {_has_prog}")
+    else:
+        st.caption("Using local save data")
+        if st.button("↻ Refresh data", use_container_width=True, help="Reload runs from disk (for new local runs)"):
+            st.cache_data.clear()
+            st.rerun()
+
+
 @st.cache_data
-def compute(act1_variant_filter: str = "All"):
-    events = load_raw_events()
+def compute(act1_variant_filter: str, source_key: str):
+    events = _get_events_data()
     if act1_variant_filter != "All":
         events = [e for e in events
                   if e["act"] != "Act 1" or e.get("act1_variant") == act1_variant_filter]
@@ -23,7 +67,8 @@ def compute(act1_variant_filter: str = "All"):
     counts_df = elo_engine.match_counts(events)
     merged = ratings_df.merge(counts_df, on=["card", "character", "act"], how="left")
     history_df = elo_engine.compute_ratings_history(events)
-    return events, merged, history_df
+    war_df = war_engine.wins_above_replacement(events)
+    return events, merged, history_df, war_df
 
 
 @st.dialog("ELO History", width="large")
@@ -86,28 +131,12 @@ act1_variant = "All"
 if selected_act == "Act 1":
     act1_variant = st.sidebar.radio("Act 1 Variant", ["All", "Overgrowth", "Underdocks"])
 
-events, df, history_df = compute(act1_variant)
+events, df, history_df, war_df = compute(act1_variant, _source_key())
 
 all_characters = sorted(df[df["card"] != "SKIP"]["character"].unique())
 selected_char = st.sidebar.selectbox("Character", all_characters)
 
 min_offered = st.sidebar.slider("Min times offered", 1, 30, 5)
-
-st.sidebar.markdown("---")
-nav_items = [
-    ("↑ Top", "top"),
-    ("Elo Leaderboard", "elo-leaderboard"),
-    ("Cards Below SKIP Threshold", "below-skip-threshold"),
-]
-if selected_act == "Act 1":
-    nav_items.append(("Alternate Act ELO Variance", "alt-act-variance"))
-nav_items += [
-    ("Character Rankings", "full-rankings-table"),
-    ("All Cards — Global", "all-cards-global-rankings"),
-]
-for label, anchor in nav_items:
-    if st.sidebar.button(label, use_container_width=True, key=f"nav_{anchor}"):
-        st.session_state["_scroll_to"] = anchor
 
 # ── Filter ─────────────────────────────────────────────────────────────────────
 view = df[
@@ -122,10 +151,16 @@ skip_row = df[df["card"] == this_skip_id]
 skip_elo = round(skip_row["elo"].values[0], 1) if not skip_row.empty else elo_engine.INITIAL_RATING
 
 # ── Header ─────────────────────────────────────────────────────────────────────
-st.markdown('<div id="top"></div>', unsafe_allow_html=True)
 char_hex = CHARACTER_COLORS.get(selected_char, "color: inherit").replace("color: ", "")
+total_runs = len({e["run_id"] for e in events if e["character"] == selected_char})
+icon_uri = character_icon_uri(selected_char)
+icon_html = (
+    f'<img src="{icon_uri}" style="height:1.2em; vertical-align:-0.2em; margin:0 0.3em;" alt="">'
+    if icon_uri else ""
+)
 st.markdown(
-    f'<h1>Card ELO — <span style="color:{char_hex}">{selected_char}</span> · {selected_act}</h1>',
+    f'<h1>Card ELO — <span style="color:{char_hex}">{selected_char}</span>{icon_html} · {selected_act}</h1>'
+    f'<p style="margin-top:-0.5rem;opacity:0.7">Data collected over {total_runs} runs</p>',
     unsafe_allow_html=True,
 )
 
@@ -187,7 +222,6 @@ if event.selection.points:
 
 # ── Below SKIP ─────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.markdown('<div id="below-skip-threshold"></div>', unsafe_allow_html=True)
 below_skip = cards_only[cards_only["elo"] < skip_elo]
 st.markdown(f'<h3 style="color:{char_hex}">Below SKIP threshold — {len(below_skip)} cards</h3>', unsafe_allow_html=True)
 st.caption("These cards are losing ELO to skipping. They were consistently passed over even when offered.")
@@ -217,12 +251,11 @@ else:
 # ── Alternate Act ELO Variance ─────────────────────────────────────────────────
 if selected_act == "Act 1":
     st.markdown("---")
-    st.markdown('<div id="alt-act-variance"></div>', unsafe_allow_html=True)
     st.markdown(f'<h3 style="color:{char_hex}">Alternate Act ELO Variance</h3>', unsafe_allow_html=True)
     st.caption("ELO delta between Overgrowth and Underdocks runs (Overgrowth − Underdocks). Positive = favours Overgrowth, negative = favours Underdocks.")
 
-    _, df_og, _ = compute("Overgrowth")
-    _, df_ud, _ = compute("Underdocks")
+    _, df_og, _, _ = compute("Overgrowth", _source_key())
+    _, df_ud, _, _ = compute("Underdocks", _source_key())
 
     OVERGROWTH_COLOR = "#4a8c5c"
     UNDERDOCKS_COLOR = "#7baabf"
@@ -243,17 +276,27 @@ if selected_act == "Act 1":
     variance_df["abs_delta"] = variance_df["delta"].abs()
     variance_df["favors"] = (variance_df["delta"] >= 0).map({True: "Overgrowth", False: "Underdocks"})
 
-    order_by = st.radio(
-        "Show cards", ["Greatest Divergence", "Favoring Overgrowth", "Favoring Underdocks"],
-        horizontal=True, key="variance_order",
-    )
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        order_by = st.radio(
+            "Show cards", ["Greatest Divergence", "Favoring Overgrowth", "Favoring Underdocks"],
+            horizontal=True, key="variance_order",
+        )
+    with col_b:
+        max_avail = max(1, len(variance_df))
+        variance_n = st.slider(
+            "Show N", 5, min(40, max_avail), min(15, max_avail), key="variance_n",
+        )
 
     if order_by == "Favoring Overgrowth":
-        plot_df = variance_df[variance_df["delta"] > 0].sort_values("delta", ascending=True)
+        plot_df = variance_df[variance_df["delta"] > 0].sort_values("delta", ascending=False).head(variance_n)
+        plot_df = plot_df.sort_values("delta", ascending=True)
     elif order_by == "Favoring Underdocks":
-        plot_df = variance_df[variance_df["delta"] < 0].sort_values("delta", ascending=False)
+        plot_df = variance_df[variance_df["delta"] < 0].sort_values("delta", ascending=True).head(variance_n)
+        plot_df = plot_df.sort_values("delta", ascending=False)
     else:
-        plot_df = variance_df.sort_values("abs_delta", ascending=True)
+        plot_df = variance_df.sort_values("abs_delta", ascending=False).head(variance_n)
+        plot_df = plot_df.sort_values("abs_delta", ascending=True)
 
     if plot_df.empty:
         st.info("No cards meet the current filter criteria for this selection.")
@@ -278,9 +321,87 @@ if selected_act == "Act 1":
         )
         st.plotly_chart(fig_var, use_container_width=True)
 
+# ── Wins Above Replacement ─────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown(f'<h3 style="color:{char_hex}">Wins Above Replacement</h3>', unsafe_allow_html=True)
+st.caption(
+    "WAR = wins when picked − (picks × character baseline win rate). "
+    "Positive WAR = card outperforms an average pick for this character."
+)
+
+war_view = war_df[
+    (war_df["character"] == selected_char) &
+    (war_df["act"] == selected_act) &
+    (war_df["picks"] >= max(1, min_offered // 2))
+].copy()
+
+if war_view.empty:
+    st.info("No cards meet the current filter criteria for WAR.")
+else:
+    war_view = war_view.sort_values("war", ascending=False).reset_index(drop=True)
+    war_n = st.slider(
+        "Show top N by WAR",
+        5, min(50, len(war_view)), min(20, len(war_view)),
+        key="war_n",
+    )
+    top_war = war_view.head(war_n)
+
+    baseline_wr = war_view["baseline_wr"].iloc[0]
+
+    fig_war = px.bar(
+        top_war,
+        x="card", y="war",
+        color="war",
+        color_continuous_scale="RdYlGn",
+        range_color=[-top_war["war"].abs().max(), top_war["war"].abs().max()],
+        height=420,
+        text="war",
+        hover_data={"picks": True, "wins": True, "win_rate": ":.1f", "baseline_wr": ":.1f"},
+    )
+    fig_war.add_hline(y=0, line_color="gray", line_width=1)
+    fig_war.update_traces(texttemplate="%{text:+.1f}", textposition="outside")
+    fig_war.update_layout(
+        xaxis_tickangle=-40,
+        margin=dict(t=20, b=100),
+        coloraxis_showscale=False,
+        xaxis_title=None,
+        yaxis_title="WAR",
+    )
+    st.plotly_chart(fig_war, use_container_width=True)
+
+    st.caption(f"Character baseline win rate: **{baseline_wr}%**")
+
+    st.markdown("##### ELO vs WAR")
+    st.caption(
+        ""
+    )
+    elo_view = df[
+        (df["character"] == selected_char) &
+        (df["act"] == selected_act) &
+        (~df["card"].str.contains("_SKIP_ACT"))
+    ][["card", "elo"]]
+    scatter_df = war_view.merge(elo_view, on="card", how="inner")
+    if not scatter_df.empty:
+        fig_sc = px.scatter(
+            scatter_df,
+            x="war", y="elo",
+            hover_name="card",
+            size="picks",
+            color="win_rate",
+            color_continuous_scale="RdYlGn",
+            range_color=[0, 100],
+            height=440,
+            labels={"war": "WAR", "elo": "ELO", "win_rate": "Win Rate %"},
+        )
+        fig_sc.add_vline(x=0, line_dash="dash", line_color="gray")
+        fig_sc.add_hline(y=elo_engine.INITIAL_RATING, line_dash="dash", line_color="gray")
+        fig_sc.update_traces(textposition="top center")
+        fig_sc.update_layout(margin=dict(t=10, b=40))
+        st.plotly_chart(fig_sc, use_container_width=True)
+
 # ── Full table ─────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.markdown(f'<h3 id="full-rankings-table" style="color:{char_hex}">Full Rankings Table</h3>', unsafe_allow_html=True)
+st.markdown(f'<h3 id="full-rankings-table" style="color:{char_hex}">{selected_char} Rankings Table</h3>', unsafe_allow_html=True)
 st.dataframe(
     cards_only[["card", "elo", "times_offered", "times_picked", "pick_rate"]].rename(columns={
         "card": "Card", "elo": "ELO", "times_offered": "Offered",
@@ -308,15 +429,50 @@ for tab, act_label in [(tab1, "Act 1"), (tab2, "Act 2"), (tab3, "Act 3")]:
         )
         st.dataframe(act_cards.style.apply(_style_global, axis=None).format({"ELO": "{:.1f}"}), use_container_width=True, height=500)
 
-# ── Scroll via JS ───────────────────────────────────────────────────────────────
-if "_scroll_to" in st.session_state:
-    target = st.session_state.pop("_scroll_to")
-    st.components.v1.html(
-        f"""
-        <script>
-            var el = window.parent.document.getElementById('{target}');
-            if (el) el.scrollIntoView({{behavior: 'smooth', block: 'start'}});
-        </script>
-        """,
-        height=0,
-    )
+# ── Global WAR rankings ────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown('<h3 id="all-cards-global-war">All Cards — Global WAR Rankings</h3>', unsafe_allow_html=True)
+st.caption(
+    "WAR is character-relative (compared against that character's baseline win rate), "
+    "so rows remain separated per character even when sorted globally."
+)
+
+war_tab1, war_tab2, war_tab3 = st.tabs(["Act 1", "Act 2", "Act 3"])
+
+
+def _style_war_global(df_in):
+    char_color = df_in["Character"].map(lambda c: CHARACTER_COLORS.get(c, ""))
+    return pd.DataFrame({
+        "Card": char_color,
+        "Character": char_color,
+        "Picks": char_color,
+        "Wins": char_color,
+        "Win Rate %": char_color,
+        "Baseline %": char_color,
+        "WAR": char_color,
+    })
+
+
+for tab, act_label in [(war_tab1, "Act 1"), (war_tab2, "Act 2"), (war_tab3, "Act 3")]:
+    with tab:
+        act_war = (
+            war_df[war_df["act"] == act_label]
+            .sort_values("war", ascending=False)
+            [["card", "character", "picks", "wins", "win_rate", "baseline_wr", "war"]]
+            .rename(columns={
+                "card": "Card", "character": "Character",
+                "picks": "Picks", "wins": "Wins",
+                "win_rate": "Win Rate %", "baseline_wr": "Baseline %",
+                "war": "WAR",
+            })
+            .reset_index(drop=True)
+        )
+        st.dataframe(
+            act_war.style.apply(_style_war_global, axis=None).format({
+                "Win Rate %": "{:.1f}",
+                "Baseline %": "{:.1f}",
+                "WAR": "{:+.2f}",
+            }),
+            use_container_width=True, height=500,
+        )
+

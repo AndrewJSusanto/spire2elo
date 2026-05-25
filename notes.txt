@@ -35,3 +35,14 @@ andrewsusanto@Andrews-MacBook-Pro spire2elo %
 sudo lsof -i :PORTNUMBER
 -- finds activity at localhost port NumberColumn
 sudo kill PID
+
+on local launch with streamlit run app.py
+
+
+
+add assets for each character
+metrics page showing data from progress.save
+
+
+add relic data to metrics page. maybe add small webps for each encounter.
+include event combats / encounters to the encounter list.

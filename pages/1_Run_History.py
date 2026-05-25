@@ -1,0 +1,981 @@
+import hashlib
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import run_parser
+from assets import character_icon_uri
+
+
+def _rr_char_icon(character: str) -> str:
+    uri = character_icon_uri(character)
+    if not uri:
+        return ""
+    return f'<img src="{uri}" style="height:1em; vertical-align:-0.18em; margin-right:6px;" alt="">'
+
+
+# ── Data source helpers ────────────────────────────────────────────────────────
+def _source_key() -> str:
+    """Cache-invalidation key. 'local' or the upload hash."""
+    return st.session_state.get("uploaded_hash", "local")
+
+
+def _get_events_data() -> list:
+    runs = st.session_state.get("uploaded_runs_by_id")
+    if runs:
+        return run_parser.events_from_runs_by_id(runs)
+    return run_parser.load_all_events()
+
+
+def _get_progress_data() -> Optional[dict]:
+    if st.session_state.get("uploaded_progress"):
+        return st.session_state["uploaded_progress"]
+    try:
+        with open(run_parser.HISTORY_DIR.parent / "progress.save") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _get_run_detail_data(run_id: str) -> dict:
+    runs = st.session_state.get("uploaded_runs_by_id")
+    if runs and run_id in runs:
+        return run_parser.load_run_detail_from_data(runs[run_id], run_id)
+    return run_parser.load_run_detail(run_id)
+
+
+def _get_runs_raw() -> dict:
+    """Returns {run_id: raw_run_data} for all available runs (uploaded or local)."""
+    runs = st.session_state.get("uploaded_runs_by_id")
+    if runs:
+        return runs
+    out = {}
+    for path in sorted(run_parser.HISTORY_DIR.glob("*.run")):
+        try:
+            with open(path) as f:
+                out[path.stem] = json.load(f)
+        except Exception:
+            continue
+    return out
+
+ROOM_COLORS = {
+    "monster": "#c75a5a",
+    "elite":   "#7a3030",
+    "boss":    "#1f1f1f",
+    "rest_site": "#5e9bd1",
+    "treasure": "#e0c060",
+    "shop":    "#7b69b0",
+    "event":   "#9bb37a",
+    "ancient": "#d76edb",
+    "unknown": "#888888",
+}
+
+CURSE_CARDS = {
+    "ASCENDERS_BANE", "GREED", "NECRONOMICURSE", "CURSE_OF_THE_BELL",
+    "PAIN", "REGRET", "SHAME", "PARASITE", "PRIDE", "WRITHE", "INJURY",
+    "DOUBT", "NORMALITY", "DECAY", "CLUMSY",
+}
+STATUS_CARDS = {"WOUND", "DAZED", "SLIMED", "BURN", "VOID"}
+
+CHIP_PALETTE = {
+    "starter":   "#888888",
+    "curse":     "#7a4ab8",
+    "enchanted": "#d8c4ff",
+    "upgraded":  "#5ec76d",
+}
+
+# Monster ids that are companions/summons rather than real enemies — exclude from encounter lists.
+ALLY_MONSTERS = {"MONSTER.OSTY"}
+
+
+@st.cache_data
+def _build_card_owner_map(source_key: str) -> dict:
+    """Card display name (w/o '+') -> character that most frequently offers it in card_choices."""
+    events = _get_events_data()
+    counts: dict = {}
+    for e in events:
+        char = e["character"]
+        for name in e["offered"]:
+            base = name.rstrip("+")
+            counts.setdefault(base, {}).setdefault(char, 0)
+            counts[base][char] += 1
+    return {card: max(by_char.items(), key=lambda kv: kv[1])[0] for card, by_char in counts.items()}
+
+
+def _card_color(card: dict, current_character: str) -> Optional[str]:
+    short = card["id"].removeprefix("CARD.")
+    if card.get("enchantment"):
+        return CHIP_PALETTE["enchanted"]
+    if card.get("current_upgrade_level", 0) >= 1:
+        return CHIP_PALETTE["upgraded"]
+    if short in CURSE_CARDS or short in STATUS_CARDS or short.startswith("CURSE_"):
+        return CHIP_PALETTE["curse"]
+    if "STRIKE_" in short or "DEFEND_" in short:
+        return CHIP_PALETTE["starter"]
+    if card.get("floor_added_to_deck", 0) == 1:
+        return CHARACTER_COLORS.get(current_character)
+    owner = _build_card_owner_map(_source_key()).get(_strip("CARD.", card["id"]))
+    if owner and owner != current_character:
+        return CHARACTER_COLORS.get(owner)
+    return None
+
+
+def _strip(prefix: str, raw: str) -> str:
+    return raw.removeprefix(prefix).replace("_", " ").title()
+
+
+def _picked_card(stats: dict) -> Optional[str]:
+    for c in stats.get("card_choices", []):
+        if c.get("was_picked"):
+            return _strip("CARD.", c["card"]["id"])
+    return None
+
+
+def _skipped_cards(stats: dict) -> list[str]:
+    return [_strip("CARD.", c["card"]["id"]) for c in stats.get("card_choices", []) if not c.get("was_picked")]
+
+
+def _picked_relic(stats: dict) -> Optional[str]:
+    for r in stats.get("relic_choices", []):
+        if r.get("was_picked"):
+            return _strip("RELIC.", r["choice"])
+    return None
+
+
+def _format_ancient(point: dict) -> list[str]:
+    stats = point["raw_point"].get("player_stats", [{}])[0]
+    ancient_name = None
+    for a in stats.get("ancient_choice", []):
+        if a.get("was_chosen"):
+            ancient_name = a.get("TextKey", "?").replace("_", " ").title()
+            break
+    lines = ["<b>Ancient</b>"]
+    if ancient_name:
+        lines.append(f"Chose: {ancient_name}")
+    relic = _picked_relic(stats)
+    if relic:
+        lines.append(f"Relic: {relic}")
+    added_cards = [_strip("CARD.", c["id"]) for c in stats.get("cards_gained", [])]
+    if added_cards:
+        lines.append(f"Added to deck: {', '.join(added_cards)}")
+    return lines
+
+
+def _format_combat(point: dict) -> list[str]:
+    stats = point["raw_point"].get("player_stats", [{}])[0]
+    rooms = point["raw_point"].get("rooms", [{}])
+    room = rooms[0] if rooms else {}
+    monsters = [m for m in room.get("monster_ids", []) if m not in ALLY_MONSTERS]
+    mob_label = ", ".join(_strip("MONSTER.", m) for m in monsters) if monsters else _strip("ENCOUNTER.", room.get("model_id", "Unknown"))
+    type_label = point["map_point_type"].upper()
+    lines = [f"<b>{type_label}</b> · {mob_label}"]
+    lines.append(f"Damage taken: {stats.get('damage_taken', 0)}")
+    healed = stats.get("hp_healed", 0)
+    if healed:
+        lines.append(f"Healed: {healed}")
+    picked = _picked_card(stats)
+    if picked:
+        lines.append(f"Picked: {picked}")
+    skipped = _skipped_cards(stats)
+    if skipped:
+        lines.append(f"Skipped: {', '.join(skipped)}")
+    relic = _picked_relic(stats)
+    if relic:
+        lines.append(f"Relic: {relic}")
+    return lines
+
+
+def _format_shop(point: dict) -> list[str]:
+    stats = point["raw_point"].get("player_stats", [{}])[0]
+    bought_cards = [_strip("CARD.", c["card"]["id"]) for c in stats.get("card_choices", []) if c.get("was_picked")]
+    skipped_cards = [_strip("CARD.", c["card"]["id"]) for c in stats.get("card_choices", []) if not c.get("was_picked")]
+    bought_relics = [_strip("RELIC.", r["choice"]) for r in stats.get("relic_choices", []) if r.get("was_picked")]
+    removed_cards = [_strip("CARD.", c["id"]) for c in stats.get("cards_removed", [])]
+
+    lines = ["<b>Shop</b>"]
+    if bought_cards:
+        lines.append(f"Cards taken: {', '.join(bought_cards)}")
+    if bought_relics:
+        lines.append(f"Relics taken: {', '.join(bought_relics)}")
+    if removed_cards:
+        lines.append(f"Cards removed: {', '.join(removed_cards)}")
+    if skipped_cards:
+        lines.append(f"Cards skipped: {', '.join(skipped_cards)}")
+    return lines
+
+
+def _format_event(point: dict) -> list[str]:
+    rooms = point["raw_point"].get("rooms", [{}])
+    room = rooms[0] if rooms else {}
+    event_name = _strip("EVENT.", room.get("model_id", "Unknown Event"))
+    # skeleton — to be expanded later
+    return [f"<b>Event</b> · {event_name}"]
+
+
+def _format_rest(point: dict) -> list[str]:
+    stats = point["raw_point"].get("player_stats", [{}])[0]
+    choices = stats.get("rest_site_choices", [])
+    lines = ["<b>Rest Site</b>"]
+    for choice in choices:
+        if choice == "REST":
+            lines.append(f"Rested · healed {stats.get('hp_healed', 0)}")
+        elif choice == "SMITH":
+            upgraded = [_strip("CARD.", c) for c in stats.get("upgraded_cards", [])]
+            lines.append(f"Smithed: {', '.join(upgraded) if upgraded else '?'}")
+        else:
+            lines.append(choice.replace("_", " ").title())
+    return lines
+
+
+def _format_default(point: dict) -> list[str]:
+    return [f"<b>{point['map_point_type'].title()}</b>", f"Floor {point['floor']}"]
+
+
+def _hover_for(point: dict) -> str:
+    t = point["map_point_type"]
+    if t == "ancient":
+        lines = _format_ancient(point)
+    elif t in ("monster", "elite", "boss"):
+        lines = _format_combat(point)
+    elif t in ("event", "unknown"):
+        lines = _format_event(point)
+    elif t == "rest_site":
+        lines = _format_rest(point)
+    elif t == "shop":
+        lines = _format_shop(point)
+    else:
+        lines = _format_default(point)
+
+    stats = point["raw_point"].get("player_stats", [{}])[0]
+    lines.append(f"HP: {stats.get('current_hp', '?')}/{stats.get('max_hp', '?')}")
+    lines.append(f"Gold: {stats.get('current_gold', '?')}")
+
+    return f"Act {point['act_idx'] + 1} · Floor {point['floor']}<br>" + "<br>".join(lines)
+
+
+def _render_run_map(detail: dict):
+    fig = go.Figure()
+    MAX_SAG = 0.85
+    MAX_RISE = 0.3
+    ACT_SPACING = 2.6
+    prev_end = None
+
+    starting_hp = 1
+    if detail["acts"] and detail["acts"][0]:
+        first_stats = detail["acts"][0][0]["raw_point"].get("player_stats", [{}])[0]
+        starting_hp = first_stats.get("current_hp") or first_stats.get("max_hp") or 1
+
+    last_act_idx = max((a[0]["act_idx"] for a in detail["acts"] if a), default=-1)
+    END_COLOR = "#2e8b3d" if detail["win"] else "#8b1a1a"
+
+    def _hp_offset(point: dict) -> float:
+        stats = point["raw_point"].get("player_stats", [{}])[0]
+        cur = stats.get("current_hp")
+        if cur is None or starting_hp <= 0:
+            return 0.0
+        delta_ratio = (cur - starting_hp) / starting_hp
+        if delta_ratio < 0:
+            return max(-MAX_SAG, MAX_SAG * delta_ratio)
+        return min(MAX_RISE, MAX_RISE * delta_ratio)
+
+    for act in detail["acts"]:
+        if not act:
+            continue
+        act_idx = act[0]["act_idx"]
+        xs = [p["position"] for p in act]
+        base_y = -act_idx * ACT_SPACING
+        ys = [base_y + _hp_offset(p) for p in act]
+        colors = [ROOM_COLORS.get(p["map_point_type"], "#888") for p in act]
+        if act_idx == last_act_idx and colors:
+            colors[-1] = END_COLOR
+        hovers = [_hover_for(p) for p in act]
+
+        if prev_end is not None:
+            fig.add_trace(go.Scatter(
+                x=[prev_end[0], xs[0]],
+                y=[prev_end[1], ys[0]],
+                mode="lines",
+                line=dict(color="rgba(200,200,200,0.35)", width=1.5, dash="dot", shape="spline", smoothing=1.3),
+                hoverinfo="skip", showlegend=False,
+            ))
+
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines",
+            line=dict(color="rgba(160,160,160,0.4)", width=2, shape="spline", smoothing=1.0),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="markers",
+            marker=dict(size=22, color=colors, line=dict(color="white", width=1)),
+            text=hovers,
+            hovertemplate="%{text}<extra></extra>",
+            showlegend=False,
+        ))
+
+        prev_end = (xs[-1], ys[-1])
+
+    fig.update_yaxes(
+        tickmode="array",
+        tickvals=[-i * ACT_SPACING for i in range(len(detail["acts"]))],
+        ticktext=[f"Act {i + 1}" for i in range(len(detail["acts"]))],
+        showgrid=False, zeroline=False,
+    )
+    fig.update_xaxes(showticklabels=False, showgrid=False, zeroline=False)
+    max_nodes = max((len(a) for a in detail["acts"]), default=1)
+    NODE_SPACING_PX = 60
+    fig_width = max(700, max_nodes * NODE_SPACING_PX + 120)
+
+    fig.update_layout(
+        height=220,
+        width=fig_width,
+        margin=dict(t=5, b=5, l=60, r=20),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+
+    chart_html = pio.to_html(fig, include_plotlyjs="cdn", full_html=False, config={"displayModeBar": False})
+    wrapped = (
+        '<div style="overflow-x:auto; overflow-y:hidden; width:100%;">'
+        f'{chart_html}'
+        '</div>'
+    )
+    st.components.v1.html(wrapped, height=240, scrolling=False)
+
+
+def _mob_label(point: dict) -> str:
+    room = point["raw_point"].get("rooms", [{}])[0]
+    monsters = [m for m in room.get("monster_ids", []) if m not in ALLY_MONSTERS]
+    if monsters:
+        return ", ".join(_strip("MONSTER.", m) for m in monsters)
+    return _strip("ENCOUNTER.", room.get("model_id", "Unknown"))
+
+
+def _render_decklist(detail: dict):
+    deck = detail.get("deck", [])
+    if not deck:
+        st.caption("No deck data.")
+        return
+
+    char_suffixes = {f"_{c.upper()}" for c in CHARACTER_COLORS}
+
+    def _card_chip_label(card: dict) -> str:
+        short = card["id"].removeprefix("CARD.")
+        for suffix in char_suffixes:
+            if short.endswith(suffix):
+                short = short[: -len(suffix)]
+                break
+        name = short.replace("_", " ").title()
+        if card.get("current_upgrade_level", 0) >= 1:
+            name += "+"
+        ench = card.get("enchantment")
+        if ench:
+            ench_name = ench["id"].removeprefix("ENCHANTMENT.").replace("_", " ").title()
+            amount = ench.get("amount", 1)
+            name += f" ({ench_name} {amount})"
+        return name
+
+    current_char = detail.get("character", "")
+
+    # Walk deck in original order; stack contiguous identical entries.
+    chips: list[dict] = []
+    for card in deck:
+        label = _card_chip_label(card)
+        color = _card_color(card, current_char)
+        if chips and chips[-1]["name"] == label and chips[-1]["color"] == color:
+            chips[-1]["count"] += 1
+        else:
+            chips.append({"name": label, "count": 1, "color": color})
+
+    html = []
+    for c in chips:
+        if c["color"]:
+            style = (
+                f'background:{c["color"]}26; '
+                f'border:1px solid {c["color"]}99; '
+                f'color:{c["color"]};'
+            )
+        else:
+            style = (
+                'background:rgba(255,255,255,0.06); '
+                'border:1px solid rgba(255,255,255,0.1); '
+                'color:inherit;'
+            )
+        html.append(
+            f'<span style="display:inline-block; padding:2px 8px; margin:2px; '
+            f'border-radius:10px; font-size:0.85rem; {style}">'
+            f'<b>{c["count"]}x</b> {c["name"]}</span>'
+        )
+    st.markdown(
+        f'<div style="line-height:1.8;">{"".join(html)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _compute_insights(detail: dict) -> dict:
+    """
+    Returns:
+        hardest:   {act, floor, mob, damage} or None
+        closest:   {act, floor, hp, max_hp} or None
+        deck_online: {after_floor, before_avg, after_avg, drop_pct} or None
+    """
+    combat_types = {"monster", "elite", "boss"}
+    all_points = [p for act in detail["acts"] for p in act]
+
+    # Hardest fight — any combat
+    combat_points = [p for p in all_points if p["map_point_type"] in combat_types]
+    hardest = None
+    if combat_points:
+        worst = max(combat_points, key=lambda p: p["raw_point"]["player_stats"][0].get("damage_taken", 0))
+        worst_stats = worst["raw_point"]["player_stats"][0]
+        if worst_stats.get("damage_taken", 0) > 0:
+            hardest = {
+                "act": worst["act_idx"] + 1,
+                "floor": worst["floor"],
+                "mob": _mob_label(worst),
+                "damage": worst_stats["damage_taken"],
+            }
+
+    # Lowest health reached — exclude HP=0 (death/end-of-run)
+    closest = None
+    hp_points = [p for p in all_points if p["raw_point"]["player_stats"]
+                 and p["raw_point"]["player_stats"][0].get("current_hp") not in (None, 0)]
+    if hp_points:
+        worst = min(hp_points, key=lambda p: p["raw_point"]["player_stats"][0]["current_hp"])
+        s = worst["raw_point"]["player_stats"][0]
+        closest = {
+            "act": worst["act_idx"] + 1,
+            "floor": worst["floor"],
+            "hp": s["current_hp"],
+            "max_hp": s.get("max_hp", "?"),
+        }
+
+    # Deck came online — split anywhere (combat or non-combat).
+    # Measure non-boss combat damage before vs after each split index.
+    measured = [(i, p) for i, p in enumerate(all_points) if p["map_point_type"] in ("monster", "elite")]
+    deck_online = None
+    if len(measured) >= 6:
+        best_drop = 0.0
+        best_split = None
+        # Iterate every node as a candidate split point; require ≥3 measured combats on each side.
+        for split_idx in range(1, len(all_points)):
+            before = [d for i, p in measured if i < split_idx for d in [p["raw_point"]["player_stats"][0].get("damage_taken", 0)]]
+            after = [d for i, p in measured if i >= split_idx for d in [p["raw_point"]["player_stats"][0].get("damage_taken", 0)]]
+            if len(before) < 3 or len(after) < 3:
+                continue
+            before_avg = sum(before) / len(before)
+            after_avg = sum(after) / len(after)
+            if before_avg <= 0:
+                continue
+            drop = (before_avg - after_avg) / before_avg
+            if drop > best_drop:
+                best_drop = drop
+                best_split = (split_idx, before, after)
+        if best_split is not None and best_drop >= 0.35:
+            split_idx, before_dmg, after_dmg = best_split
+            split_node = all_points[split_idx - 1]  # the node that completed the inflection
+            deck_online = {
+                "after_floor": split_node["floor"],
+                "after_act": split_node["act_idx"] + 1,
+                "after_type": split_node["map_point_type"],
+                "before_avg": sum(before_dmg) / len(before_dmg),
+                "after_avg": sum(after_dmg) / len(after_dmg),
+                "drop_pct": best_drop * 100,
+            }
+
+    # Big shop trip — shop with the most gold spent
+    shops = [p for p in all_points if p["map_point_type"] == "shop"]
+    big_shop = None
+    if shops:
+        biggest = max(shops, key=lambda p: p["raw_point"]["player_stats"][0].get("gold_spent", 0))
+        bs = biggest["raw_point"]["player_stats"][0]
+        spent = bs.get("gold_spent", 0)
+        if spent > 0:
+            bought_cards = [_strip("CARD.", c["card"]["id"]) for c in bs.get("card_choices", []) if c.get("was_picked")]
+            bought_relics = [_strip("RELIC.", r["choice"]) for r in bs.get("relic_choices", []) if r.get("was_picked")]
+            removed_cards = [_strip("CARD.", c["id"]) for c in bs.get("cards_removed", [])]
+            big_shop = {
+                "act": biggest["act_idx"] + 1,
+                "floor": biggest["floor"],
+                "spent": spent,
+                "cards": bought_cards,
+                "relics": bought_relics,
+                "removed": removed_cards,
+            }
+
+    return {"hardest": hardest, "closest": closest, "deck_online": deck_online, "big_shop": big_shop}
+
+
+def _render_insights(detail: dict):
+    insights = _compute_insights(detail)
+    if insights["hardest"]:
+        h = insights["hardest"]
+        st.markdown(f"**Highest Damage Taken** — Act {h['act']} · Floor {h['floor']} · {h['mob']} · took **{h['damage']} dmg**")
+    if insights["closest"]:
+        c = insights["closest"]
+        st.markdown(f"**Lowest Health Reached** — Act {c['act']} · Floor {c['floor']} · dropped to **{c['hp']}/{c['max_hp']} HP**")
+    if insights["deck_online"]:
+        d = insights["deck_online"]
+        st.markdown(
+            f"**📈 Deck came online** — after Act {d['after_act']} · Floor {d['after_floor']} "
+            f"({d['after_type']}) · avg dmg per combat fell "
+            f"**{d['before_avg']:.1f} → {d['after_avg']:.1f}** ({d['drop_pct']:.0f}% drop)"
+        )
+    elif insights["hardest"]:
+        st.caption("No clear 'deck online' inflection — damage stayed relatively steady throughout.")
+    if insights["big_shop"]:
+        s = insights["big_shop"]
+        parts = []
+        if s["cards"]:
+            parts.append(f"Cards bought: {', '.join(s['cards'])}")
+        if s["relics"]:
+            parts.append(f"Relics bought: {', '.join(s['relics'])}")
+        if s["removed"]:
+            parts.append(f"Card removal: {', '.join(s['removed'])}")
+        detail_str = " · ".join(parts) if parts else "—"
+        st.markdown(
+            f"**Largest Sum Spent** — Act {s['act']} · Floor {s['floor']} · "
+            f"spent **{s['spent']}g** · {detail_str}"
+        )
+
+
+def _render_legend(win: bool):
+    end_color = "#2e8b3d" if win else "#8b1a1a"
+    end_label = "Final (Win)" if win else "Final (Loss)"
+    items = list(ROOM_COLORS.items()) + [("end", end_color)]
+    html = ['<div style="font-size:0.8rem; line-height:1.6; padding-top:4px;">']
+    for room_type, color in items:
+        label = end_label if room_type == "end" else room_type.replace("_", " ").title()
+        if room_type == "end":
+            color = end_color
+        html.append(
+            f'<div style="display:flex; align-items:center; gap:6px;">'
+            f'<span style="display:inline-block; width:11px; height:11px; background:{color}; border-radius:50%; border:1px solid rgba(255,255,255,0.3);"></span>'
+            f'<span>{label}</span>'
+            f'</div>'
+        )
+    html.append('</div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+@st.dialog("Run Timeline", width="large")
+def show_run_detail(run_id: str):
+    detail = _get_run_detail_data(run_id)
+    result_label = "Win" if detail["win"] else "Loss"
+    result_color = WIN_COLOR if detail["win"] else LOSS_COLOR
+    char_hex = CHARACTER_COLORS.get(detail["character"], "inherit")
+    icon_html = _rr_char_icon(detail["character"])
+    st.markdown(
+        f'<h4 style="margin:0;">{icon_html}'
+        f'<span style="color:{char_hex}">{detail["character"]}</span> - '
+        f'A{detail["ascension"]} - '
+        f'<span style="color:{result_color}">{result_label}</span></h4>',
+        unsafe_allow_html=True,
+    )
+
+    graph_col, legend_col = st.columns([8, 1])
+    with graph_col:
+        _render_run_map(detail)
+    with legend_col:
+        _render_legend(detail["win"])
+
+    with st.container(height=480, border=True):
+        deck_col, insights_col = st.columns(2)
+        TIGHT_HR = '<hr style="margin:0.1rem 0 0.6rem 0; border:none; border-top:1px solid rgba(255,255,255,0.15);">'
+        with deck_col:
+            st.markdown(f"##### Decklist{TIGHT_HR}", unsafe_allow_html=True)
+            _render_decklist(detail)
+        with insights_col:
+            st.markdown(f"##### Insights{TIGHT_HR}", unsafe_allow_html=True)
+            _render_insights(detail)
+
+st.set_page_config(page_title="Run History — Spire2ELO", page_icon="📜", layout="wide")
+
+CHARACTER_COLORS = {
+    "Ironclad": "#e05555",
+    "Regent": "#e07b30",
+    "Necrobinder": "#b39ddb",
+    "Silent": "#4caf50",
+    "Defect": "#64b5f6",
+}
+WIN_COLOR = "#4caf50"
+LOSS_COLOR = "#e05555"
+
+
+@st.cache_data
+def load_run_summaries(source_key: str) -> pd.DataFrame:
+    events = _get_events_data()
+    summaries: dict[str, dict] = {}
+    for e in events:
+        rid = e["run_id"]
+        if rid not in summaries:
+            summaries[rid] = {
+                "run_id": rid,
+                "character": e["character"],
+                "ascension": e["ascension"],
+                "run_won": e["run_won"],
+                "act1_variant": e.get("act1_variant"),
+                "final_floor": e.get("final_floor", 0),
+                "final_deck_size": e.get("final_deck_size", 0),
+            }
+
+    rows = []
+    for rid, s in summaries.items():
+        try:
+            ts = int(rid)
+            date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            date = rid
+        rows.append({
+            "run_id": rid,
+            "date": date,
+            "character": s["character"],
+            "ascension": s["ascension"],
+            "act1_variant": s["act1_variant"] or "—",
+            "won": s["run_won"],
+            "final_floor": s["final_floor"],
+            "final_deck_size": s["final_deck_size"],
+        })
+    return pd.DataFrame(rows).sort_values("run_id", ascending=False).reset_index(drop=True)
+
+
+def load_progress() -> dict:
+    return _get_progress_data() or {}
+
+
+def _fmt_secs(s: int) -> str:
+    if not s:
+        return "—"
+    h, rem = divmod(int(s), 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
+def _filter_char_entries(progress: dict, filter_char: str) -> list:
+    entries = [e for e in progress.get("character_stats", []) if e.get("id") != "CHARACTER.RANDOM_CHARACTER"]
+    if filter_char == "All":
+        return entries
+    target = f"CHARACTER.{filter_char.upper()}"
+    return [e for e in entries if e.get("id") == target]
+
+
+def _aggregate_badges(entries: list) -> dict:
+    """Returns {(id, rarity): total_count}."""
+    out: dict = {}
+    for e in entries:
+        for b in e.get("badges", []):
+            key = (b["id"], b["rarity"])
+            out[key] = out.get(key, 0) + b.get("count", 1)
+    return out
+
+
+ANCIENT_ORDER = [
+    ("EVENT.NEOW", "1"),
+    ("EVENT.OROBAS", "2"),
+    ("EVENT.PAEL", "2"),
+    ("EVENT.TEZCATARA", "2"),
+    ("EVENT.TANX", "3"),
+    ("EVENT.NONUPEIPE", "3"),
+    ("EVENT.VAKUU", "3"),
+    ("EVENT.DARV", None),  # special — split into Act 2 / Act 3 from .run files
+]
+
+
+@st.cache_data
+def load_ancient_encounters(source_key: str) -> list:
+    """One row per ancient encounter: {run_id, character, ancient_id, act_idx (0-based), won}."""
+    out = []
+    for run_id, data in _get_runs_raw().items():
+        won = data.get("win", False)
+        char = data["players"][0]["character"]
+        for act_idx, act in enumerate(data.get("map_point_history", [])):
+            for point in act:
+                if point.get("map_point_type") != "ancient":
+                    continue
+                for room in point.get("rooms", []):
+                    aid = room.get("model_id")
+                    if aid:
+                        out.append({
+                            "run_id": run_id,
+                            "character": char,
+                            "ancient_id": aid,
+                            "act_idx": act_idx,
+                            "won": won,
+                        })
+    return out
+
+
+def _darv_rows(filter_char: str) -> list:
+    target = None if filter_char == "All" else f"CHARACTER.{filter_char.upper()}"
+    encs = [e for e in load_ancient_encounters(_source_key()) if e["ancient_id"] == "EVENT.DARV"]
+    if target:
+        encs = [e for e in encs if e["character"] == target]
+    by_act: dict = {}
+    for e in encs:
+        bucket = by_act.setdefault(e["act_idx"], {"wins": 0, "losses": 0})
+        if e["won"]:
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+    rows = []
+    for act_idx in (1, 2):  # Act 2 then Act 3
+        if act_idx not in by_act:
+            continue
+        s = by_act[act_idx]
+        total = s["wins"] + s["losses"]
+        if total > 0:
+            rows.append({
+                "Act": str(act_idx + 1),
+                "Ancient": "Darv",
+                "W": s["wins"], "L": s["losses"],
+                "Win Rate %": round(s["wins"] / total * 100, 1),
+            })
+    return rows
+
+
+def _ancient_winrates(progress: dict, filter_char: str) -> list:
+    target = None if filter_char == "All" else f"CHARACTER.{filter_char.upper()}"
+    by_id = {a["ancient_id"]: a for a in progress.get("ancient_stats", [])}
+
+    rows = []
+    for aid, act in ANCIENT_ORDER:
+        if aid == "EVENT.DARV":
+            rows.extend(_darv_rows(filter_char))
+            continue
+        ancient = by_id.get(aid)
+        if not ancient:
+            continue
+        wins, losses = 0, 0
+        for entry in ancient.get("character_stats", []):
+            if target is None or entry["character"] == target:
+                wins += entry.get("wins", 0)
+                losses += entry.get("losses", 0)
+        total = wins + losses
+        if total > 0:
+            rows.append({
+                "Act": act,
+                "Ancient": aid.removeprefix("EVENT.").replace("_", " ").title(),
+                "W": wins, "L": losses, "Win Rate %": round(wins / total * 100, 1),
+            })
+    rows.sort(key=lambda r: int(r["Act"]))
+    return rows
+
+
+BADGE_RARITY_COLOR = {"gold": "#e7c14e", "silver": "#c0c4cc", "bronze": "#c98758"}
+
+
+def _render_lifetime_panel(progress: dict, filter_char: str):
+    entries = _filter_char_entries(progress, filter_char)
+    if not entries:
+        st.info("No lifetime stats available.")
+        return
+
+    total_wins = sum(e.get("total_wins", 0) for e in entries)
+    total_losses = sum(e.get("total_losses", 0) for e in entries)
+    total = total_wins + total_losses
+    win_rate = (total_wins / total * 100) if total else 0
+    best_streak = max((e.get("best_win_streak", 0) for e in entries), default=0)
+    cur_streak = entries[0].get("current_streak", 0) if filter_char != "All" else None
+    fastest_vals = [e.get("fastest_win_time", 0) for e in entries if e.get("fastest_win_time", 0) > 0]
+    fastest = min(fastest_vals) if fastest_vals else 0
+    max_asc = max((e.get("max_ascension", 0) for e in entries), default=0)
+    playtime = sum(e.get("playtime", 0) for e in entries)
+
+    metrics = [
+        ("Wins", total_wins),
+        ("Losses", total_losses),
+        ("Win Rate", f"{win_rate:.1f}%"),
+        ("Best Streak", best_streak),
+    ]
+    if cur_streak is not None:
+        metrics.append(("Current Streak", cur_streak))
+    metrics.append(("Fastest", _fmt_secs(fastest)))
+    metrics.append(("Max Asc", max_asc))
+
+    st.markdown(
+        """
+        <style>
+        [data-testid="stMetricValue"] { font-size: 1.2rem; }
+        [data-testid="stMetricLabel"] { font-size: 0.78rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(len(metrics))
+    for col, (label, value) in zip(cols, metrics):
+        col.metric(label, value)
+    st.caption(f"Total playtime: {_fmt_secs(playtime)}")
+
+    badges = _aggregate_badges(entries)
+    if badges:
+        chips = []
+        rarity_rank = {"gold": 0, "silver": 1, "bronze": 2}
+        for (badge_id, rarity), count in sorted(
+            badges.items(),
+            key=lambda kv: (rarity_rank.get(kv[0][1], 99), -kv[1], kv[0][0]),
+        ):
+            color = BADGE_RARITY_COLOR.get(rarity, "#888")
+            label = badge_id.replace("_", " ").title()
+            chips.append(
+                f'<span style="display:inline-block; padding:2px 8px; margin:2px; '
+                f'border-radius:10px; background:{color}22; border:1px solid {color}99; '
+                f'color:{color}; font-size:0.8rem;"><b>{count}x</b> {label}</span>'
+            )
+        st.markdown(
+            f'<div style="line-height:1.8;">{"".join(chips)}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def _render_ancient_panel(progress: dict, filter_char: str):
+    rows = _ancient_winrates(progress, filter_char)
+    if not rows:
+        st.caption("No ancient encounters recorded.")
+        return
+    st.dataframe(
+        pd.DataFrame(rows),
+        hide_index=True,
+        use_container_width=True,
+        height=min(40 + 36 * len(rows), 320),
+    )
+
+
+# ── Save data uploader ─────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### Save data")
+    uploaded = st.file_uploader(
+        "Upload your zipped `saves/` folder",
+        type=["zip"],
+        help="Zip your Slay the Spire 2 saves folder (containing `progress.save` and `history/`) and drop it here.",
+        key="saves_zip_uploader",
+    )
+    if uploaded is not None:
+        new_hash = hashlib.sha1(uploaded.getvalue()).hexdigest()[:16]
+        if st.session_state.get("uploaded_hash") != new_hash:
+            with st.spinner("Parsing save data…"):
+                parsed = run_parser.parse_uploaded_zip(uploaded.getvalue())
+            st.session_state["uploaded_runs_by_id"] = parsed["runs_by_id"]
+            st.session_state["uploaded_progress"] = parsed["progress"]
+            st.session_state["uploaded_hash"] = new_hash
+            st.rerun()
+    elif st.session_state.get("uploaded_hash"):
+        for k in ("uploaded_runs_by_id", "uploaded_progress", "uploaded_hash"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
+    if st.session_state.get("uploaded_hash"):
+        n_runs = len(st.session_state.get("uploaded_runs_by_id", {}))
+        has_prog = "✓" if st.session_state.get("uploaded_progress") else "✗"
+        st.caption(f"Uploaded: **{n_runs}** runs · progress.save {has_prog}")
+    else:
+        st.caption("Using local save data")
+        if st.button("↻ Refresh data", use_container_width=True, help="Reload runs from disk (for new local runs)"):
+            st.cache_data.clear()
+            st.rerun()
+
+st.title("Run History")
+st.caption("Most recent runs at the top. Click a run to inspect its full timeline.")
+
+df = load_run_summaries(_source_key())
+all_chars = sorted(df["character"].unique())
+
+selected_char = st.segmented_control("Character", ["All"] + all_chars, default="All")
+if selected_char is None:
+    selected_char = "All"
+
+progress = load_progress()
+header_label = "All Characters" if selected_char == "All" else selected_char
+header_icon = "" if selected_char == "All" else _rr_char_icon(selected_char)
+st.markdown(
+    f'<h5>Lifetime — {header_icon}{header_label}</h5>',
+    unsafe_allow_html=True,
+)
+stats_col, ancient_col = st.columns([3, 2])
+with stats_col:
+    _render_lifetime_panel(progress, selected_char)
+with ancient_col:
+    st.markdown("**Ancient win rates**")
+    _render_ancient_panel(progress, selected_char)
+
+st.markdown("---")
+
+view = df if selected_char == "All" else df[df["character"] == selected_char].reset_index(drop=True)
+
+st.markdown(
+    """
+    <style>
+    .run-row {
+        display: flex;
+        align-items: center;
+        padding: 10px 14px;
+        margin-bottom: 6px;
+        border-radius: 6px;
+        border-left: 4px solid;
+        background: rgba(255,255,255,0.02);
+        font-size: 0.92rem;
+        line-height: 1.3;
+    }
+    .run-row.win  { border-left-color: #4caf50; background: rgba(76,175,80,0.06); }
+    .run-row.loss { border-left-color: #e05555; background: rgba(224,85,85,0.05); }
+    .rr-result { width: 60px; font-weight: 700; }
+    .rr-char   { width: 165px; font-weight: 600; display: flex; align-items: center; }
+    .rr-meta   { flex: 1; opacity: 0.85; display: flex; gap: 12px; align-items: center; }
+    .rr-meta .rr-sep { opacity: 0.3; }
+    .rr-meta small { opacity: 0.7; }
+    .rr-date   { width: 130px; text-align: right; opacity: 0.65; font-size: 0.85rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+PAGE_SIZE = 25
+total = len(view)
+if total > PAGE_SIZE:
+    page = st.number_input("Page", 1, (total + PAGE_SIZE - 1) // PAGE_SIZE, 1, key="rh_page")
+    start = (page - 1) * PAGE_SIZE
+    view_page = view.iloc[start:start + PAGE_SIZE].reset_index(drop=True)
+    st.caption(f"Showing {start + 1}–{start + len(view_page)} of {total} runs")
+else:
+    view_page = view
+    st.caption(f"Showing {total} of {total} runs")
+
+for run in view_page.itertuples(index=False):
+    char_color = CHARACTER_COLORS.get(run.character, "#cccccc")
+    result_class = "win" if run.won else "loss"
+    result_label = "WIN" if run.won else "LOSS"
+    result_color = WIN_COLOR if run.won else LOSS_COLOR
+
+    card_html = (
+        f'<div class="run-row {result_class}">'
+        f'<div class="rr-result" style="color:{result_color}">{result_label}</div>'
+        f'<div class="rr-char" style="color:{char_color}">{_rr_char_icon(run.character)}{run.character}</div>'
+        f'<div class="rr-meta">'
+        f'<span>A{run.ascension}</span>'
+        f'<span class="rr-sep">|</span>'
+        f'<small>{run.act1_variant}</small>'
+        f'<span class="rr-sep">|</span>'
+        f'<small><span style="display:inline-block;min-width:4.5em">Floor {run.final_floor}</span>{"👑" if run.won else "💀"}</small>'
+        f'<span class="rr-sep">|</span>'
+        f'<small>{run.final_deck_size} card deck</small>'
+        f'</div>'
+        f'<div class="rr-date">{run.date}</div>'
+        f'</div>'
+    )
+
+    cols = st.columns([10, 1])
+    with cols[0]:
+        st.markdown(card_html, unsafe_allow_html=True)
+    with cols[1]:
+        if st.button("→", key=f"view_{run.run_id}", use_container_width=True):
+            show_run_detail(run.run_id)
