@@ -1129,17 +1129,20 @@ if df.empty:
 
 all_chars = sorted(df["character"].unique())
 
-# Character filter rendered before the title row so the streak indicator can read it.
+# Title slot rendered first (visually on top)
+title_slot = st.empty()
+
 selected_char = st.segmented_control("Character", ["All"] + all_chars, default="All")
 if selected_char is None:
     selected_char = "All"
 
-title_col, streak_col = st.columns([3, 2])
-with title_col:
-    st.title("Run History")
-    st.caption("Most recent runs at the top. Click a run to inspect its full timeline.")
-with streak_col:
-    _render_streak_indicator(df, selected_char)
+with title_slot.container():
+    title_col, streak_col = st.columns([3, 2])
+    with title_col:
+        st.title("Run History")
+        st.caption("Most recent runs at the top. Click a run to inspect its full timeline.")
+    with streak_col:
+        _render_streak_indicator(df, selected_char)
 
 progress = load_progress()
 header_label = "All Characters" if selected_char == "All" else selected_char
