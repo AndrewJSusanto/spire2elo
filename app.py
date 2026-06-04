@@ -120,8 +120,9 @@ if not events:
         "folder in the sidebar."
     )
     st.caption(
-        "Your `saves/` folder lives at `~/Library/Application Support/SlayTheSpire2/"
-        "steam/<id>/profile<n>/saves` on macOS, or the equivalent path on other platforms. "
+        "Your `saves/` folder lives at "
+        "`~/Library/Application Support/SlayTheSpire2/steam/<id>/profile<n>/saves` on macOS, "
+        r"or `C:\Users\<user>\AppData\Roaming\SlayTheSpire2\steam` on Windows. "
         "Zip the folder (containing `progress.save` and `history/`) and drop it into the uploader."
     )
     st.stop()
