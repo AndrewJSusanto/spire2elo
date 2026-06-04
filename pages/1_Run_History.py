@@ -1,4 +1,3 @@
-import hashlib
 import json
 import sys
 from datetime import datetime
@@ -13,6 +12,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import run_parser
 from assets import character_icon_uri, relic_icon_uri
+from save_panel import render_save_panel
 
 
 def _rr_char_icon(character: str) -> str:
@@ -995,38 +995,8 @@ def _render_ancient_panel(progress: dict, filter_char: str):
     )
 
 
-# ── Save data uploader ─────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### Save data")
-    uploaded = st.file_uploader(
-        "Upload your zipped `saves/` folder",
-        type=["zip"],
-        help="Zip your Slay the Spire 2 saves folder (containing `progress.save` and `history/`) and drop it here.",
-        key="saves_zip_uploader",
-    )
-    if uploaded is not None:
-        new_hash = hashlib.sha1(uploaded.getvalue()).hexdigest()[:16]
-        if st.session_state.get("uploaded_hash") != new_hash:
-            with st.spinner("Parsing save data…"):
-                parsed = run_parser.parse_uploaded_zip(uploaded.getvalue())
-            st.session_state["uploaded_runs_by_id"] = parsed["runs_by_id"]
-            st.session_state["uploaded_progress"] = parsed["progress"]
-            st.session_state["uploaded_hash"] = new_hash
-            st.rerun()
-    elif st.session_state.get("uploaded_hash"):
-        for k in ("uploaded_runs_by_id", "uploaded_progress", "uploaded_hash"):
-            st.session_state.pop(k, None)
-        st.rerun()
-
-    if st.session_state.get("uploaded_hash"):
-        n_runs = len(st.session_state.get("uploaded_runs_by_id", {}))
-        has_prog = "✓" if st.session_state.get("uploaded_progress") else "✗"
-        st.caption(f"Uploaded: **{n_runs}** runs · progress.save {has_prog}")
-    else:
-        st.caption("Using local save data")
-        if st.button("↻ Refresh data", use_container_width=True, help="Reload runs from disk (for new local runs)"):
-            st.cache_data.clear()
-            st.rerun()
+# ── Save data uploader (shared) ───────────────────────────────────────────────
+render_save_panel()
 
 st.title("Run History")
 st.caption("Most recent runs at the top. Click a run to inspect its full timeline.")

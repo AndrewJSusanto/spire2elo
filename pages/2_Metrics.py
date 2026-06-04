@@ -8,8 +8,10 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import run_parser
 from assets import character_icon_uri, relic_icon_uri
+from save_panel import render_save_panel
 
 st.set_page_config(page_title="Metrics — Spire2ELO", page_icon="📊", layout="wide")
+render_save_panel()
 
 
 CHARACTER_COLORS = {

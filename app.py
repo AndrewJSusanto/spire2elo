@@ -1,5 +1,3 @@
-import hashlib
-
 import streamlit as st
 import plotly.express as px
 import pandas as pd
@@ -7,6 +5,7 @@ import run_parser
 import elo as elo_engine
 import war as war_engine
 from assets import character_icon_uri
+from save_panel import render_save_panel
 
 st.set_page_config(page_title="Spire2ELO", page_icon="⚔️", layout="wide")
 
@@ -22,38 +21,8 @@ def _get_events_data() -> list:
     return run_parser.load_all_events()
 
 
-# ── Sidebar uploader (renders before everything else needs the data) ───────────
-with st.sidebar:
-    st.markdown("### Save data")
-    _uploaded = st.file_uploader(
-        "Upload your zipped `saves/` folder",
-        type=["zip"],
-        help="Zip your Slay the Spire 2 saves folder and drop it here.",
-        key="saves_zip_uploader",
-    )
-    if _uploaded is not None:
-        _new_hash = hashlib.sha1(_uploaded.getvalue()).hexdigest()[:16]
-        if st.session_state.get("uploaded_hash") != _new_hash:
-            with st.spinner("Parsing save data…"):
-                _parsed = run_parser.parse_uploaded_zip(_uploaded.getvalue())
-            st.session_state["uploaded_runs_by_id"] = _parsed["runs_by_id"]
-            st.session_state["uploaded_progress"] = _parsed["progress"]
-            st.session_state["uploaded_hash"] = _new_hash
-            st.rerun()
-    elif st.session_state.get("uploaded_hash"):
-        for _k in ("uploaded_runs_by_id", "uploaded_progress", "uploaded_hash"):
-            st.session_state.pop(_k, None)
-        st.rerun()
-
-    if st.session_state.get("uploaded_hash"):
-        _n = len(st.session_state.get("uploaded_runs_by_id", {}))
-        _has_prog = "✓" if st.session_state.get("uploaded_progress") else "✗"
-        st.caption(f"Uploaded: **{_n}** runs · progress.save {_has_prog}")
-    else:
-        st.caption("Using local save data")
-        if st.button("↻ Refresh data", use_container_width=True, help="Reload runs from disk (for new local runs)"):
-            st.cache_data.clear()
-            st.rerun()
+# ── Sidebar uploader (shared helper — renders before everything else needs the data) ──
+render_save_panel()
 
 
 _EMPTY_MERGED = pd.DataFrame(columns=[
@@ -148,7 +117,7 @@ if not events:
     st.title("Spire2ELO")
     st.info(
         "👋 No run data loaded yet. Upload your zipped Slay the Spire 2 `saves/` "
-        "folder in the sidebar to see your card ELO rankings."
+        "folder in the sidebar."
     )
     st.caption(
         "Your `saves/` folder lives at `~/Library/Application Support/SlayTheSpire2/"
