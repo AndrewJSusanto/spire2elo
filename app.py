@@ -56,12 +56,23 @@ with st.sidebar:
             st.rerun()
 
 
+_EMPTY_MERGED = pd.DataFrame(columns=[
+    "card", "character", "act", "elo", "times_offered", "times_picked", "pick_rate",
+])
+_EMPTY_HISTORY = pd.DataFrame(columns=["run_index", "run_id", "card", "character", "act", "elo"])
+_EMPTY_WAR = pd.DataFrame(columns=[
+    "card", "character", "act", "picks", "wins", "win_rate", "baseline_wr", "war",
+])
+
+
 @st.cache_data
 def compute(act1_variant_filter: str, source_key: str):
     events = _get_events_data()
     if act1_variant_filter != "All":
         events = [e for e in events
                   if e["act"] != "Act 1" or e.get("act1_variant") == act1_variant_filter]
+    if not events:
+        return events, _EMPTY_MERGED.copy(), _EMPTY_HISTORY.copy(), _EMPTY_WAR.copy()
     ratings = elo_engine.compute_ratings(events)
     ratings_df = elo_engine.ratings_to_df(ratings)
     counts_df = elo_engine.match_counts(events)
@@ -132,6 +143,19 @@ if selected_act == "Act 1":
     act1_variant = st.sidebar.radio("Act 1 Variant", ["All", "Overgrowth", "Underdocks"])
 
 events, df, history_df, war_df = compute(act1_variant, _source_key())
+
+if not events:
+    st.title("Spire2ELO")
+    st.info(
+        "👋 No run data loaded yet. Upload your zipped Slay the Spire 2 `saves/` "
+        "folder in the sidebar to see your card ELO rankings."
+    )
+    st.caption(
+        "Your `saves/` folder lives at `~/Library/Application Support/SlayTheSpire2/"
+        "steam/<id>/profile<n>/saves` on macOS, or the equivalent path on other platforms. "
+        "Zip the folder (containing `progress.save` and `history/`) and drop it into the uploader."
+    )
+    st.stop()
 
 all_characters = sorted(df[df["card"] != "SKIP"]["character"].unique())
 selected_char = st.sidebar.selectbox("Character", all_characters)
