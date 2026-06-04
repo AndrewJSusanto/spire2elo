@@ -768,6 +768,13 @@ def load_run_summaries(source_key: str) -> pd.DataFrame:
                 "final_deck_size": e.get("final_deck_size", 0),
             }
 
+    columns = [
+        "run_id", "date", "character", "ascension", "act1_variant",
+        "won", "final_floor", "final_deck_size", "ancient_relics",
+    ]
+    if not summaries:
+        return pd.DataFrame(columns=columns)
+
     ancients = _ancient_relics_per_run(source_key)
     rows = []
     for rid, s in summaries.items():
@@ -1120,6 +1127,21 @@ def _render_ancient_panel(progress: dict, filter_char: str):
 render_save_panel()
 
 df = load_run_summaries(_source_key())
+
+if df.empty:
+    st.title("Run History")
+    st.info(
+        "👋 No run data loaded yet. Upload your zipped Slay the Spire 2 `saves/` "
+        "folder in the sidebar."
+    )
+    st.caption(
+        "Your `saves/` folder lives at "
+        "`~/Library/Application Support/SlayTheSpire2/steam/<id>/profile<n>/saves` on macOS, "
+        r"or something like `C:\Users\<user>\AppData\Roaming\SlayTheSpire2\steam` on Windows. "
+        "Zip the folder (containing `progress.save` and `history/`) and drop it into the uploader."
+    )
+    st.stop()
+
 all_chars = sorted(df["character"].unique())
 
 # Character filter rendered before the title row so the streak indicator can read it.
