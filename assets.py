@@ -25,14 +25,24 @@ YUMMY_COOKIE_CHAR_SUFFIX = {
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
-def _file_to_data_uri(path: Path) -> str:
-    if not path.exists():
-        return ""
-    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+@st.cache_data
+def _encode_webp(path_str: str) -> str:
+    """Read a webp at `path_str` and return its base64 data URI. Cached.
+
+    Important: this is only called for paths that actually exist — we don't
+    want to cache empty results, because a webp added to the folder after a
+    prior miss should self-heal on the next call.
+    """
+    b64 = base64.b64encode(Path(path_str).read_bytes()).decode("ascii")
     return f"data:image/webp;base64,{b64}"
 
 
-@st.cache_data
+def _file_to_data_uri(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return _encode_webp(str(path))
+
+
 def character_icon_uri(character: str) -> str:
     """Return a base64-encoded data URI for the character's .webp icon, or '' if missing."""
     name = CHARACTER_ICON_NAMES.get(character)
@@ -41,7 +51,6 @@ def character_icon_uri(character: str) -> str:
     return _file_to_data_uri(_STATIC_DIR / "characters" / f"{name}.webp")
 
 
-@st.cache_data
 def relic_icon_uri(relic_id: str, character: Optional[str] = None) -> str:
     """Return a base64-encoded data URI for a relic's .webp.
 
@@ -54,7 +63,6 @@ def relic_icon_uri(relic_id: str, character: Optional[str] = None) -> str:
     return _file_to_data_uri(_STATIC_DIR / "relics" / f"{name}.webp")
 
 
-@st.cache_data
 def potion_icon_uri(potion_id: str) -> str:
     """Return a base64-encoded data URI for a potion's .webp."""
     name = potion_id.removeprefix("POTION.").lower()
