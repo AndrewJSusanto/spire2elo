@@ -930,22 +930,18 @@ def _render_lifetime_panel(progress: dict, filter_char: str):
     total = total_wins + total_losses
     win_rate = (total_wins / total * 100) if total else 0
     best_streak = max((e.get("best_win_streak", 0) for e in entries), default=0)
-    cur_streak = entries[0].get("current_streak", 0) if filter_char != "All" else None
     fastest_vals = [e.get("fastest_win_time", 0) for e in entries if e.get("fastest_win_time", 0) > 0]
     fastest = min(fastest_vals) if fastest_vals else 0
     max_asc = max((e.get("max_ascension", 0) for e in entries), default=0)
     playtime = sum(e.get("playtime", 0) for e in entries)
 
     metrics = [
-        ("Wins", total_wins),
-        ("Losses", total_losses),
+        ("Record", f"{total_wins}W / {total_losses}L"),
         ("Win Rate", f"{win_rate:.1f}%"),
         ("Best Streak", best_streak),
+        ("Fastest", _fmt_secs(fastest)),
+        ("Max Asc", max_asc),
     ]
-    if cur_streak is not None:
-        metrics.append(("Current Streak", cur_streak))
-    metrics.append(("Fastest", _fmt_secs(fastest)))
-    metrics.append(("Max Asc", max_asc))
 
     st.markdown(
         """
@@ -982,6 +978,131 @@ def _render_lifetime_panel(progress: dict, filter_char: str):
         )
 
 
+def _current_streak_chars(df: pd.DataFrame, filter_char: str = "All") -> list:
+    """Return the list of characters (most-recent first) for the current consecutive-win streak.
+
+    Iterates rows of `df` (which is already most-recent first), stopping at the first loss.
+    """
+    view = df if filter_char == "All" else df[df["character"] == filter_char]
+    chars: list = []
+    for _, row in view.iterrows():
+        if row["won"]:
+            chars.append(row["character"])
+        else:
+            break
+    return chars
+
+
+def _render_streak_indicator(df: pd.DataFrame, selected_char: str):
+    rotating_count = len(_current_streak_chars(df, "All"))
+    char_count = len(_current_streak_chars(df, selected_char)) if selected_char != "All" else 0
+
+    # Character line — always rendered so layout stays put; hidden when on "All".
+    if selected_char != "All":
+        char_hex = CHARACTER_COLORS.get(selected_char, "#ccc")
+        char_line = (
+            f'<div style="font-size:0.92rem;">'
+            f'<span style="color:{char_hex}; font-weight:600;">{selected_char}</span>: '
+            f'<b>{char_count}</b></div>'
+        )
+    else:
+        char_line = '<div style="font-size:0.92rem; visibility:hidden;">&nbsp;</div>'
+
+    # Flourish indicator — always rendered (placeholder when not relevant) for
+    # layout stability. Only visible on a character tab with an active streak.
+    if selected_char != "All" and char_count > 0:
+        icon = _rr_char_icon(selected_char)
+        indicator_inner = f'{icon}{char_count}-streak!'
+        indicator_style = ""
+    else:
+        indicator_inner = "&nbsp;"
+        indicator_style = "visibility:hidden;"
+
+    st.markdown(
+        f'<div style="text-align:right; padding-top:14px;">'
+        f'<div style="font-size:0.72rem; text-transform:uppercase; '
+        f'letter-spacing:0.08em; opacity:0.55;">Current Streaks</div>'
+        f'<div style="font-size:0.92rem; margin-top:2px;">Rotating: <b>{rotating_count}</b></div>'
+        f'{char_line}'
+        f'<div style="margin-top:10px; font-size:1.05rem; font-weight:700; '
+        f'letter-spacing:0.01em; min-height:1.4em; {indicator_style}">'
+        f'{indicator_inner}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_recent_panel(df: pd.DataFrame, filter_char: str, n: int = 10):
+    """Aggregates from the first N rows of the run-summaries DataFrame
+    (already sorted most-recent first by `load_run_summaries`)."""
+    view = df if filter_char == "All" else df[df["character"] == filter_char]
+    recent = view.head(n)
+    if recent.empty:
+        st.info("No runs available for the selected character.")
+        return
+
+    wons = recent["won"].tolist()  # most-recent first
+    wins = sum(1 for w in wons if w)
+    losses = len(wons) - wins
+    win_rate = (wins / len(wons) * 100) if wons else 0
+    max_asc = int(recent["ascension"].max())
+
+    metrics = [
+        ("Record", f"{wins}W / {losses}L"),
+        ("Win Rate", f"{win_rate:.1f}%"),
+        ("Max Asc", max_asc),
+    ]
+
+    st.markdown(
+        """
+        <style>
+        [data-testid="stMetricValue"] { font-size: 1.2rem; }
+        [data-testid="stMetricLabel"] { font-size: 0.78rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(len(metrics))
+    for col, (label, value) in zip(cols, metrics):
+        col.metric(label, value)
+    st.caption(f"Based on the **{len(recent)}** most recent runs")
+
+    # ── Last-N visualizer: one box per run (most recent on the left) ────────
+    boxes = []
+    for _, row in recent.iterrows():
+        color = "#4caf50" if row["won"] else "#e05555"
+        tooltip = (
+            f"{'WIN' if row['won'] else 'LOSS'} · {row['character']} "
+            f"A{row['ascension']} · Floor {row['final_floor']}"
+        )
+        boxes.append(
+            f'<div class="last10-box" style="background:{color};" title="{tooltip}"></div>'
+        )
+    st.markdown(
+        """
+        <style>
+        .last10-strip {
+            display: flex;
+            gap: 5px;
+            margin-top: 8px;
+            align-items: center;
+        }
+        .last10-box {
+            width: 26px;
+            height: 26px;
+            border-radius: 4px;
+            border: 1px solid rgba(255,255,255,0.12);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="last10-strip">{"".join(boxes)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _render_ancient_panel(progress: dict, filter_char: str):
     rows = _ancient_winrates(progress, filter_char)
     if not rows:
@@ -998,26 +1119,47 @@ def _render_ancient_panel(progress: dict, filter_char: str):
 # ── Save data uploader (shared) ───────────────────────────────────────────────
 render_save_panel()
 
-st.title("Run History")
-st.caption("Most recent runs at the top. Click a run to inspect its full timeline.")
-
 df = load_run_summaries(_source_key())
 all_chars = sorted(df["character"].unique())
 
+# Character filter rendered before the title row so the streak indicator can read it.
 selected_char = st.segmented_control("Character", ["All"] + all_chars, default="All")
 if selected_char is None:
     selected_char = "All"
 
+title_col, streak_col = st.columns([3, 2])
+with title_col:
+    st.title("Run History")
+    st.caption("Most recent runs at the top. Click a run to inspect its full timeline.")
+with streak_col:
+    _render_streak_indicator(df, selected_char)
+
 progress = load_progress()
 header_label = "All Characters" if selected_char == "All" else selected_char
 header_icon = "" if selected_char == "All" else _rr_char_icon(selected_char)
+
+overview_mode = st.segmented_control(
+    "Overview window",
+    ["Lifetime", "Last 10 runs"],
+    default="Last 10 runs",
+    key="overview_mode",
+    label_visibility="collapsed",
+)
+if overview_mode is None:
+    overview_mode = "Last 10 runs"
+
+header_prefix = "Lifetime" if overview_mode == "Lifetime" else "Last 10"
 st.markdown(
-    f'<h5>Lifetime — {header_icon}{header_label}</h5>',
+    f'<h5>{header_prefix} — {header_icon}{header_label}</h5>',
     unsafe_allow_html=True,
 )
+
 stats_col, ancient_col = st.columns([3, 2])
 with stats_col:
-    _render_lifetime_panel(progress, selected_char)
+    if overview_mode == "Last 10 runs":
+        _render_recent_panel(df, selected_char, n=10)
+    else:
+        _render_lifetime_panel(progress, selected_char)
 with ancient_col:
     st.markdown("**Ancient win rates**")
     _render_ancient_panel(progress, selected_char)
