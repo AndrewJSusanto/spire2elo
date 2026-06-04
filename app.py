@@ -34,25 +34,42 @@ _EMPTY_WAR = pd.DataFrame(columns=[
 ])
 
 
+def _filter_events(events: list, act1_variant_filter: str) -> list:
+    if act1_variant_filter == "All":
+        return events
+    return [e for e in events
+            if e["act"] != "Act 1" or e.get("act1_variant") == act1_variant_filter]
+
+
 @st.cache_data
 def compute(act1_variant_filter: str, source_key: str):
-    events = _get_events_data()
-    if act1_variant_filter != "All":
-        events = [e for e in events
-                  if e["act"] != "Act 1" or e.get("act1_variant") == act1_variant_filter]
+    """Eager: events + ratings + counts + WAR. History is deferred to compute_history()."""
+    events = _filter_events(_get_events_data(), act1_variant_filter)
     if not events:
-        return events, _EMPTY_MERGED.copy(), _EMPTY_HISTORY.copy(), _EMPTY_WAR.copy()
+        return events, _EMPTY_MERGED.copy(), _EMPTY_WAR.copy()
     ratings = elo_engine.compute_ratings(events)
     ratings_df = elo_engine.ratings_to_df(ratings)
     counts_df = elo_engine.match_counts(events)
     merged = ratings_df.merge(counts_df, on=["card", "character", "act"], how="left")
-    history_df = elo_engine.compute_ratings_history(events)
     war_df = war_engine.wins_above_replacement(events)
-    return events, merged, history_df, war_df
+    return events, merged, war_df
+
+
+@st.cache_data
+def compute_history(act1_variant_filter: str, source_key: str) -> pd.DataFrame:
+    """Lazy: ELO history snapshots per run. Expensive — invoked only when the
+    ELO-history modal opens, then cached per (filter, source) key."""
+    events = _filter_events(_get_events_data(), act1_variant_filter)
+    if not events:
+        return _EMPTY_HISTORY.copy()
+    return elo_engine.compute_ratings_history(events)
 
 
 @st.dialog("ELO History", width="large")
-def show_elo_history(card: str, char: str, act: str, skip_elo: float, skip_label: str):
+def show_elo_history(card: str, char: str, act: str, skip_elo: float,
+                     skip_label: str, act1_variant_filter: str):
+    with st.spinner("Computing ELO history…"):
+        history_df = compute_history(act1_variant_filter, _source_key())
     card_history = history_df[
         (history_df["card"] == card) &
         (history_df["character"] == char) &
@@ -111,7 +128,7 @@ act1_variant = "All"
 if selected_act == "Act 1":
     act1_variant = st.sidebar.radio("Act 1 Variant", ["All", "Overgrowth", "Underdocks"])
 
-events, df, history_df, war_df = compute(act1_variant, _source_key())
+events, df, war_df = compute(act1_variant, _source_key())
 
 if not events:
     st.title("Spire2ELO")
@@ -212,7 +229,7 @@ fig.update_layout(
 event = st.plotly_chart(fig, on_select="rerun", selection_mode="points", use_container_width=True)
 if event.selection.points:
     clicked_card = event.selection.points[0]["x"]
-    show_elo_history(clicked_card, selected_char, selected_act, skip_elo, this_skip_id)
+    show_elo_history(clicked_card, selected_char, selected_act, skip_elo, this_skip_id, act1_variant)
 
 # ── Below SKIP ─────────────────────────────────────────────────────────────────
 st.markdown("---")
@@ -240,7 +257,7 @@ else:
     event2 = st.plotly_chart(fig2, on_select="rerun", selection_mode="points", use_container_width=True)
     if event2.selection.points:
         clicked_card = event2.selection.points[0]["x"]
-        show_elo_history(clicked_card, selected_char, selected_act, skip_elo, this_skip_id)
+        show_elo_history(clicked_card, selected_char, selected_act, skip_elo, this_skip_id, act1_variant)
 
 # ── Alternate Act ELO Variance ─────────────────────────────────────────────────
 if selected_act == "Act 1":
@@ -248,8 +265,8 @@ if selected_act == "Act 1":
     st.markdown(f'<h3 style="color:{char_hex}">Alternate Act ELO Variance</h3>', unsafe_allow_html=True)
     st.caption("ELO delta between Overgrowth and Underdocks runs (Overgrowth − Underdocks). Positive = favours Overgrowth, negative = favours Underdocks.")
 
-    _, df_og, _, _ = compute("Overgrowth", _source_key())
-    _, df_ud, _, _ = compute("Underdocks", _source_key())
+    _, df_og, _ = compute("Overgrowth", _source_key())
+    _, df_ud, _ = compute("Underdocks", _source_key())
 
     OVERGROWTH_COLOR = "#4a8c5c"
     UNDERDOCKS_COLOR = "#7baabf"

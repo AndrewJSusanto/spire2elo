@@ -729,16 +729,29 @@ LOSS_COLOR = "#e05555"
 
 
 @st.cache_data
-def _ancient_relics_per_run(source_key: str) -> dict:
-    """Returns {run_id: [relic_id, ...]} for relics chosen at ancient nodes, in order.
+def load_run_summaries(source_key: str) -> pd.DataFrame:
+    """Build the Run History row list directly from raw run dicts.
 
-    Reads `ancient_choice` entries where `was_chosen` is true; TextKey is the bare
-    relic name (e.g. 'TOY_BOX'), which we re-prefix to match the RELIC.* convention.
+    Skips the heavier event-extraction path (`events_from_runs_by_id`) which
+    walks every card_choice in every player_stats — none of which the row list
+    needs. Also fuses the ancient-relic extraction into the same map_point_history
+    walk, so we visit each run's history exactly once.
     """
-    out: dict = {}
-    for run_id, data in _get_runs_raw(source_key).items():
+    columns = [
+        "run_id", "date", "character", "ascension", "act1_variant",
+        "won", "final_floor", "final_deck_size", "ancient_relics",
+    ]
+    runs_raw = _get_runs_raw(source_key)
+    if not runs_raw:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for rid, data in runs_raw.items():
+        # Single walk over map_point_history: count floors + collect ancient relics.
+        floor_count = 0
         relics = []
         for act in data.get("map_point_history", []):
+            floor_count += len(act)
             for point in act:
                 if point.get("map_point_type") != "ancient":
                     continue
@@ -746,54 +759,26 @@ def _ancient_relics_per_run(source_key: str) -> dict:
                     for ac in ps.get("ancient_choice", []):
                         if ac.get("was_chosen") and ac.get("TextKey"):
                             relics.append(f"RELIC.{ac['TextKey']}")
-        if relics:
-            out[run_id] = relics
-    return out
 
-
-@st.cache_data
-def load_run_summaries(source_key: str) -> pd.DataFrame:
-    events = _get_events_data()
-    summaries: dict[str, dict] = {}
-    for e in events:
-        rid = e["run_id"]
-        if rid not in summaries:
-            summaries[rid] = {
-                "run_id": rid,
-                "character": e["character"],
-                "ascension": e["ascension"],
-                "run_won": e["run_won"],
-                "act1_variant": e.get("act1_variant"),
-                "final_floor": e.get("final_floor", 0),
-                "final_deck_size": e.get("final_deck_size", 0),
-            }
-
-    columns = [
-        "run_id", "date", "character", "ascension", "act1_variant",
-        "won", "final_floor", "final_deck_size", "ancient_relics",
-    ]
-    if not summaries:
-        return pd.DataFrame(columns=columns)
-
-    ancients = _ancient_relics_per_run(source_key)
-    rows = []
-    for rid, s in summaries.items():
+        raw_acts = data.get("acts", [])
         try:
             ts = int(rid)
             date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
         except ValueError:
             date = rid
+
         rows.append({
             "run_id": rid,
             "date": date,
-            "character": s["character"],
-            "ascension": s["ascension"],
-            "act1_variant": s["act1_variant"] or "—",
-            "won": s["run_won"],
-            "final_floor": s["final_floor"],
-            "final_deck_size": s["final_deck_size"],
-            "ancient_relics": ancients.get(rid, []),
+            "character": data["players"][0]["character"].removeprefix("CHARACTER.").title(),
+            "ascension": data.get("ascension", 0),
+            "act1_variant": raw_acts[0].removeprefix("ACT.").title() if raw_acts else "—",
+            "won": data.get("win", False),
+            "final_floor": floor_count,
+            "final_deck_size": len(data["players"][0].get("deck", [])),
+            "ancient_relics": relics,
         })
+
     return pd.DataFrame(rows).sort_values("run_id", ascending=False).reset_index(drop=True)
 
 
