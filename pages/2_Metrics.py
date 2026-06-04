@@ -1,12 +1,13 @@
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import run_parser
-from assets import character_icon_uri
+from assets import character_icon_uri, relic_icon_uri
 
 st.set_page_config(page_title="Metrics — Spire2ELO", page_icon="📊", layout="wide")
 
@@ -25,7 +26,9 @@ def _source_key() -> str:
     return st.session_state.get("uploaded_hash", "local")
 
 
-def _get_runs_raw() -> dict:
+@st.cache_data
+def _get_runs_raw(source_key: str) -> dict:
+    """Cached per `source_key` so disk-backed runs are parsed once per session."""
     runs = st.session_state.get("uploaded_runs_by_id")
     if runs:
         return runs
@@ -37,6 +40,27 @@ def _get_runs_raw() -> dict:
         except Exception:
             continue
     return out
+
+
+def _get_progress_data() -> Optional[dict]:
+    """progress.save — authoritative source for lifetime W/L (includes pre-`.run` history)."""
+    if st.session_state.get("uploaded_progress"):
+        return st.session_state["uploaded_progress"]
+    try:
+        with open(run_parser.HISTORY_DIR.parent / "progress.save") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _lifetime_wl(progress: Optional[dict], target_char: str) -> Optional[tuple]:
+    """Returns (wins, losses) for target_char from progress.save, or None if unavailable."""
+    if not progress:
+        return None
+    for cs in progress.get("character_stats", []):
+        if cs.get("id") == target_char:
+            return cs.get("total_wins", 0), cs.get("total_losses", 0)
+    return None
 
 
 # ── Encounter helpers ────────────────────────────────────────────────────────
@@ -78,7 +102,7 @@ def _encounter_stats_derived(source_key: str) -> dict:
     }
     """
     out: dict = {}
-    for data in _get_runs_raw().values():
+    for data in _get_runs_raw(source_key).values():
         char = data["players"][0]["character"]
         raw_acts = data.get("acts", [])
         variant = raw_acts[0].removeprefix("ACT.").title() if raw_acts else None
@@ -185,6 +209,285 @@ def _render_overview_row(label: str, entries: list, value_fmt):
             f' · {value_fmt(enc)}</span>'
         )
     st.markdown("".join(chips), unsafe_allow_html=True)
+
+
+# ── Ancient relic stats ───────────────────────────────────────────────────────
+ANCIENT_ORDER = [
+    ("EVENT.NEOW",      0),     # Act 1
+    ("EVENT.OROBAS",    1),     # Act 2
+    ("EVENT.PAEL",      1),
+    ("EVENT.TEZCATARA", 1),
+    ("EVENT.TANX",      2),     # Act 3
+    ("EVENT.NONUPEIPE", 2),
+    ("EVENT.VAKUU",     2),
+    # Darv appears in either Act 2 or 3; split into per-act buckets at render time.
+]
+
+
+@st.cache_data
+def _ancient_relic_stats(source_key: str, target_char: str) -> dict:
+    """
+    Per-ancient relic offering + pick + win stats for one character.
+
+    Returns:
+        {
+            "ancients":    {ancient_id: bucket},                # aggregate across all runs
+            "variants":    {(ancient_id, variant): bucket},     # Act-1 split (Overgrowth/Underdocks)
+            "darv_by_act": {act_idx: bucket},                   # Darv split by which act it appeared in
+            "total_runs":  int,
+            "total_wins":  int,
+        }
+        bucket = {
+            "encounters":     int,
+            "encounter_wins": int,
+            "options": {relic_id: {"offered": int, "picked": int, "wins_when_picked": int}},
+        }
+    """
+    def _new_bucket():
+        return {"encounters": 0, "encounter_wins": 0, "options": {}}
+
+    def _tally_choice(bkt, relic_id, was_chosen, won):
+        opt = bkt["options"].setdefault(relic_id, {
+            "offered": 0, "picked": 0, "wins_when_picked": 0,
+        })
+        opt["offered"] += 1
+        if was_chosen:
+            opt["picked"] += 1
+            if won:
+                opt["wins_when_picked"] += 1
+
+    ancients: dict = {}
+    variants: dict = {}
+    darv_by_act: dict = {}
+    total_runs = 0
+    total_wins = 0
+    for data in _get_runs_raw(source_key).values():
+        if data["players"][0]["character"] != target_char:
+            continue
+        won = data.get("win", False)
+        total_runs += 1
+        if won:
+            total_wins += 1
+        raw_acts = data.get("acts", [])
+        act1_variant = raw_acts[0].removeprefix("ACT.").title() if raw_acts else None
+
+        seen_id: set = set()
+        seen_variant: set = set()
+        for act_idx, act in enumerate(data.get("map_point_history", [])):
+            for point in act:
+                if point.get("map_point_type") != "ancient":
+                    continue
+                rooms = point.get("rooms", [])
+                ancient_id = rooms[0].get("model_id") if rooms else None
+                if not ancient_id:
+                    continue
+                bucket = ancients.setdefault(ancient_id, _new_bucket())
+                vbucket = None
+                if act_idx == 0 and act1_variant:
+                    vbucket = variants.setdefault((ancient_id, act1_variant), _new_bucket())
+                dbucket = None
+                if ancient_id == "EVENT.DARV":
+                    dbucket = darv_by_act.setdefault(act_idx, _new_bucket())
+
+                if ancient_id not in seen_id:
+                    bucket["encounters"] += 1
+                    if won:
+                        bucket["encounter_wins"] += 1
+                    seen_id.add(ancient_id)
+                if vbucket is not None and (ancient_id, act1_variant) not in seen_variant:
+                    vbucket["encounters"] += 1
+                    if won:
+                        vbucket["encounter_wins"] += 1
+                    seen_variant.add((ancient_id, act1_variant))
+                if dbucket is not None:
+                    dbucket["encounters"] += 1
+                    if won:
+                        dbucket["encounter_wins"] += 1
+
+                for ps in point.get("player_stats", []):
+                    for ac in ps.get("ancient_choice", []):
+                        text_key = ac.get("TextKey")
+                        if not text_key:
+                            continue
+                        relic_id = f"RELIC.{text_key}"
+                        was_chosen = bool(ac.get("was_chosen"))
+                        _tally_choice(bucket, relic_id, was_chosen, won)
+                        if vbucket is not None:
+                            _tally_choice(vbucket, relic_id, was_chosen, won)
+                        if dbucket is not None:
+                            _tally_choice(dbucket, relic_id, was_chosen, won)
+    return {
+        "ancients": ancients,
+        "variants": variants,
+        "darv_by_act": darv_by_act,
+        "total_runs": total_runs,
+        "total_wins": total_wins,
+    }
+
+
+def _wr_delta_color(delta: float) -> str:
+    if delta >=  10: return "#4caf50"
+    if delta >=   3: return "#7cb342"
+    if delta >=  -3: return "#c0c4cc"
+    if delta >= -10: return "#ef6c00"
+    return "#c62828"
+
+
+def _render_ancient_relics(target_char: str, selected_char: str, sort_by: str = "pickrate"):
+    stats = _ancient_relic_stats(_source_key(), target_char)
+    if stats["total_runs"] == 0:
+        st.caption("No runs for this character.")
+        return
+
+    lifetime = _lifetime_wl(_get_progress_data(), target_char)
+    if lifetime is not None:
+        wins, losses = lifetime
+        total = wins + losses
+        baseline = (wins / total * 100) if total else 0
+        st.caption(
+            f"Character baseline: **{baseline:.1f}%** run win rate over "
+            f"**{wins}W / {losses}L** (lifetime, from `progress.save`). "
+            f"Per-relic stats below are based on **{stats['total_runs']}** runs "
+            f"with detailed `.run` history."
+        )
+    else:
+        baseline = (stats["total_wins"] / stats["total_runs"] * 100) if stats["total_runs"] else 0
+        st.caption(
+            f"Character baseline: **{baseline:.1f}%** run win rate over "
+            f"{stats['total_wins']}W / {stats['total_runs'] - stats['total_wins']}L "
+            "(from `.run` files; lifetime `progress.save` not available)."
+        )
+
+    st.markdown(
+        """
+        <style>
+        .relic-row {
+            display: flex; align-items: center; gap: 12px;
+            padding: 6px 10px; margin: 3px 0;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            font-size: 0.88rem;
+        }
+        .relic-row-icon {
+            width: 32px; height: 32px; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .relic-row-icon img {
+            height: 30px; width: 30px; object-fit: contain; border-radius: 4px;
+        }
+        .relic-row-name { flex: 1; font-weight: 500; }
+        .relic-row-stat { white-space: nowrap; opacity: 0.85; }
+        .relic-row-stat small {
+            opacity: 0.55; font-size: 0.78em; margin-right: 4px;
+            text-transform: uppercase; letter-spacing: 0.05em;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    def _sort_key(kv):
+        _, opt = kv
+        picked, offered, wins = opt["picked"], opt["offered"], opt["wins_when_picked"]
+        if sort_by == "winrate":
+            # Never-picked sink to the bottom; ties broken by picks desc.
+            wr = (wins / picked) if picked else -1
+            return (-(wr >= 0), -wr, -picked)
+        # pickrate (default)
+        rate = (picked / offered) if offered else 0
+        return (-rate, -picked)
+
+    def _render_one(ancient_id: str, bucket: dict):
+        enc = bucket["encounters"]
+        enc_wins = bucket["encounter_wins"]
+        reach_wr = (enc_wins / enc * 100) if enc else 0
+        st.caption(
+            f"Seen **{enc}×** · {enc_wins} / {enc} won "
+            f"({reach_wr:.1f}% WR)"
+        )
+        options = sorted(bucket["options"].items(), key=_sort_key)
+        rows = []
+        for relic_id, opt in options:
+            label = relic_id.removeprefix("RELIC.").replace("_", " ").title()
+            uri = relic_icon_uri(relic_id, character=selected_char)
+            picked = opt["picked"]
+            offered = opt["offered"]
+            wins = opt["wins_when_picked"]
+
+            if picked > 0:
+                wr = wins / picked * 100
+                delta = wr - baseline
+                color = _wr_delta_color(delta)
+                sign = "+" if delta >= 0 else ""
+                wr_chunk = (
+                    f'<b>{wr:.1f}%</b> WR '
+                    f'<span style="color:{color}; font-weight:600;">({sign}{delta:.1f})</span>'
+                )
+            else:
+                wr_chunk = '<span style="opacity:0.45;">never picked</span>'
+
+            img_html = f'<img src="{uri}" alt="">' if uri else ""
+            rows.append(
+                f'<div class="relic-row">'
+                f'<div class="relic-row-icon">{img_html}</div>'
+                f'<div class="relic-row-name">{label}</div>'
+                f'<div class="relic-row-stat"><small>Picked</small>{picked}/{offered}</div>'
+                f'<div class="relic-row-stat">{wr_chunk}</div>'
+                f'</div>'
+            )
+        st.markdown("".join(rows), unsafe_allow_html=True)
+
+    # Group present ancients by act. Each entry is (display_name, ancient_id, bucket).
+    groups: dict = {}
+    for ancient_id, act_idx in ANCIENT_ORDER:
+        bucket = stats["ancients"].get(ancient_id)
+        if not bucket or not bucket["options"]:
+            continue
+        display_name = ancient_id.removeprefix("EVENT.").title()
+        groups.setdefault(act_idx, []).append((display_name, ancient_id, bucket))
+
+    # Inject Darv as a per-act tab into the act it appeared in.
+    for act_idx, dbucket in stats.get("darv_by_act", {}).items():
+        if not dbucket["options"]:
+            continue
+        groups.setdefault(act_idx, []).append(
+            (f"Darv (Act {act_idx + 1})", "EVENT.DARV", dbucket)
+        )
+
+    ACT_NAMES = {0: None, 1: "Hive", 2: "Glory"}
+
+    def _group_label(key) -> str:
+        suffix = ACT_NAMES.get(key)
+        return f"Act {key + 1} - {suffix}" if suffix else f"Act {key + 1}"
+
+    for act_key in sorted(groups.keys()):
+        group = groups[act_key]
+        with st.expander(_group_label(act_key), expanded=False):
+            if act_key == 0:
+                # Act 1: split Neow by Act 1 variant + an aggregate tab.
+                _, ancient_id, bucket = group[0]
+                variant_names = ["Aggregate", "Overgrowth", "Underdocks"]
+                tabs = st.tabs(variant_names)
+                for vname, tab in zip(variant_names, tabs):
+                    with tab:
+                        if vname == "Aggregate":
+                            _render_one(ancient_id, bucket)
+                            continue
+                        vbucket = stats["variants"].get((ancient_id, vname))
+                        if not vbucket or not vbucket["options"]:
+                            st.caption(f"No {vname} runs for this character.")
+                        else:
+                            _render_one(ancient_id, vbucket)
+            elif len(group) == 1:
+                _, ancient_id, bucket = group[0]
+                _render_one(ancient_id, bucket)
+            else:
+                tab_labels = [name for name, _, _ in group]
+                tabs = st.tabs(tab_labels)
+                for tab, (_, ancient_id, bucket) in zip(tabs, group):
+                    with tab:
+                        _render_one(ancient_id, bucket)
 
 
 def _collect_for_act(stats: dict, target_char: str, act_idx: int, variant_key: str, hide_perfect: bool) -> dict:
@@ -335,4 +638,17 @@ with tab_enc:
     st.caption("Enemies (individual monster stats) — coming soon.")
 
 with tab_relic:
-    st.caption("Relics — coming soon.")
+    st.markdown("##### Ancient Relic Picks")
+    st.caption(
+        "Per-ancient relic offerings — win rate when picked vs the baseline "
+        "(this character's win rate among runs that reached this ancient). "
+        "Δ = points above/below baseline."
+    )
+    sort_choice = st.segmented_control(
+        "Sort by", ["Pick rate", "Win rate"],
+        default="Pick rate", key="ancient_sort",
+    )
+    sort_key = "winrate" if sort_choice == "Win rate" else "pickrate"
+    _render_ancient_relics(target_char, selected_char, sort_by=sort_key)
+    st.markdown("---")
+    st.caption("Full relics breakdown — coming next.")

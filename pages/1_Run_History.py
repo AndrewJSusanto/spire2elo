@@ -12,7 +12,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import run_parser
-from assets import character_icon_uri
+from assets import character_icon_uri, relic_icon_uri
 
 
 def _rr_char_icon(character: str) -> str:
@@ -52,8 +52,13 @@ def _get_run_detail_data(run_id: str) -> dict:
     return run_parser.load_run_detail(run_id)
 
 
-def _get_runs_raw() -> dict:
-    """Returns {run_id: raw_run_data} for all available runs (uploaded or local)."""
+@st.cache_data
+def _get_runs_raw(source_key: str) -> dict:
+    """Returns {run_id: raw_run_data} for all available runs (uploaded or local).
+
+    Cached on `source_key` so disk-backed runs are read+parsed once per session,
+    and an upload swap (different source_key) triggers a refresh.
+    """
     runs = st.session_state.get("uploaded_runs_by_id")
     if runs:
         return runs
@@ -177,6 +182,9 @@ def _format_combat(point: dict) -> list[str]:
     mob_label = ", ".join(_strip("MONSTER.", m) for m in monsters) if monsters else _strip("ENCOUNTER.", room.get("model_id", "Unknown"))
     type_label = point["map_point_type"].upper()
     lines = [f"<b>{type_label}</b> · {mob_label}"]
+    turns = room.get("turns_taken")
+    if turns:
+        lines.append(f"Turns: {turns}")
     lines.append(f"Damage taken: {stats.get('damage_taken', 0)}")
     healed = stats.get("hp_healed", 0)
     if healed:
@@ -513,20 +521,128 @@ def _compute_insights(detail: dict) -> dict:
     return {"hardest": hardest, "closest": closest, "deck_online": deck_online, "big_shop": big_shop}
 
 
+def _render_relics_bar(detail: dict):
+    relics = detail.get("relics", [])
+    if not relics:
+        st.caption("No relics.")
+        return
+    char = detail.get("character", "")
+    sorted_relics = sorted(relics, key=lambda r: r.get("floor_added_to_deck", 0))
+    items = []
+    for r in sorted_relics:
+        rid = r.get("id", "")
+        if not rid:
+            continue
+        label = rid.removeprefix("RELIC.").replace("_", " ").title()
+        uri = relic_icon_uri(rid, character=char)
+        if uri:
+            items.append(
+                f'<span class="relic-tip" data-tooltip="{label}">'
+                f'<img src="{uri}" class="dl-relic-icon" alt="{label}"></span>'
+            )
+        else:
+            items.append(
+                f'<span class="relic-tip dl-relic-fallback" data-tooltip="{label}">{label}</span>'
+            )
+    st.markdown(
+        """
+        <style>
+        .dl-relic-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            align-items: center;
+            padding: 4px 0;
+        }
+        .dl-relic-icon {
+            height: 30px;
+            width: 30px;
+            object-fit: contain;
+            border-radius: 4px;
+        }
+        .dl-relic-fallback {
+            font-size: 0.78rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.15);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(f'<div class="dl-relic-bar">{"".join(items)}</div>', unsafe_allow_html=True)
+
+
+# Stashed
 def _render_insights(detail: dict):
     insights = _compute_insights(detail)
+
+    st.markdown(
+        """
+        <style>
+        .insight-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            opacity: 0.6;
+            margin-top: 10px;
+            margin-bottom: 2px;
+        }
+        .insight-chip {
+            display: inline-block;
+            padding: 6px 12px;
+            margin: 4px 4px 4px 0;
+            border-radius: 6px;
+            font-size: 0.88rem;
+            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.06);
+            color: inherit;
+            font-weight: 500;
+        }
+        .insight-chip b { font-weight: 700; }
+        .insight-chip .ctx {
+            opacity: 0.55;
+            font-weight: 400;
+            font-size: 0.85em;
+        }
+        .insight-extra {
+            font-size: 0.82rem;
+            opacity: 0.65;
+            padding-left: 4px;
+            margin-top: -2px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    def _emit(label: str, body: str, extra: str = ""):
+        html = f'<div class="insight-label">{label}</div><span class="insight-chip">{body}</span>'
+        if extra:
+            html += f'<div class="insight-extra">{extra}</div>'
+        st.markdown(html, unsafe_allow_html=True)
+
     if insights["hardest"]:
         h = insights["hardest"]
-        st.markdown(f"**Highest Damage Taken** — Act {h['act']} · Floor {h['floor']} · {h['mob']} · took **{h['damage']} dmg**")
+        _emit(
+            "Highest Damage Taken",
+            f'<b>{h["damage"]} dmg</b> · {h["mob"]} '
+            f'<span class="ctx">(Act {h["act"]} · Floor {h["floor"]})</span>',
+        )
     if insights["closest"]:
         c = insights["closest"]
-        st.markdown(f"**Lowest Health Reached** — Act {c['act']} · Floor {c['floor']} · dropped to **{c['hp']}/{c['max_hp']} HP**")
+        _emit(
+            "Lowest Health Reached",
+            f'<b>{c["hp"]}/{c["max_hp"]} HP</b> '
+            f'<span class="ctx">(Act {c["act"]} · Floor {c["floor"]})</span>',
+        )
     if insights["deck_online"]:
         d = insights["deck_online"]
-        st.markdown(
-            f"**📈 Deck came online** — after Act {d['after_act']} · Floor {d['after_floor']} "
-            f"({d['after_type']}) · avg dmg per combat fell "
-            f"**{d['before_avg']:.1f} → {d['after_avg']:.1f}** ({d['drop_pct']:.0f}% drop)"
+        _emit(
+            "Deck Came Online",
+            f'<b>{d["before_avg"]:.1f} → {d["after_avg"]:.1f}</b> avg dmg '
+            f'<span class="ctx">({d["drop_pct"]:.0f}% drop · after Act {d["after_act"]} · Floor {d["after_floor"]})</span>',
         )
     elif insights["hardest"]:
         st.caption("No clear 'deck online' inflection — damage stayed relatively steady throughout.")
@@ -534,15 +650,16 @@ def _render_insights(detail: dict):
         s = insights["big_shop"]
         parts = []
         if s["cards"]:
-            parts.append(f"Cards bought: {', '.join(s['cards'])}")
+            parts.append(f"Cards: {', '.join(s['cards'])}")
         if s["relics"]:
-            parts.append(f"Relics bought: {', '.join(s['relics'])}")
+            parts.append(f"Relics: {', '.join(s['relics'])}")
         if s["removed"]:
-            parts.append(f"Card removal: {', '.join(s['removed'])}")
-        detail_str = " · ".join(parts) if parts else "—"
-        st.markdown(
-            f"**Largest Sum Spent** — Act {s['act']} · Floor {s['floor']} · "
-            f"spent **{s['spent']}g** · {detail_str}"
+            parts.append(f"Removed: {', '.join(s['removed'])}")
+        _emit(
+            "Largest Sum Spent",
+            f'<b>{s["spent"]}g</b> '
+            f'<span class="ctx">(Act {s["act"]} · Floor {s["floor"]})</span>',
+            extra=" · ".join(parts),
         )
 
 
@@ -592,9 +709,11 @@ def show_run_detail(run_id: str):
         with deck_col:
             st.markdown(f"##### Decklist{TIGHT_HR}", unsafe_allow_html=True)
             _render_decklist(detail)
+            st.markdown(f"##### Relics{TIGHT_HR}", unsafe_allow_html=True)
+            _render_relics_bar(detail)
         with insights_col:
-            st.markdown(f"##### Insights{TIGHT_HR}", unsafe_allow_html=True)
-            _render_insights(detail)
+            # Insights intentionally blank — see _render_insights for stashed code.
+            pass
 
 st.set_page_config(page_title="Run History — Spire2ELO", page_icon="📜", layout="wide")
 
@@ -607,6 +726,29 @@ CHARACTER_COLORS = {
 }
 WIN_COLOR = "#4caf50"
 LOSS_COLOR = "#e05555"
+
+
+@st.cache_data
+def _ancient_relics_per_run(source_key: str) -> dict:
+    """Returns {run_id: [relic_id, ...]} for relics chosen at ancient nodes, in order.
+
+    Reads `ancient_choice` entries where `was_chosen` is true; TextKey is the bare
+    relic name (e.g. 'TOY_BOX'), which we re-prefix to match the RELIC.* convention.
+    """
+    out: dict = {}
+    for run_id, data in _get_runs_raw(source_key).items():
+        relics = []
+        for act in data.get("map_point_history", []):
+            for point in act:
+                if point.get("map_point_type") != "ancient":
+                    continue
+                for ps in point.get("player_stats", []):
+                    for ac in ps.get("ancient_choice", []):
+                        if ac.get("was_chosen") and ac.get("TextKey"):
+                            relics.append(f"RELIC.{ac['TextKey']}")
+        if relics:
+            out[run_id] = relics
+    return out
 
 
 @st.cache_data
@@ -626,6 +768,7 @@ def load_run_summaries(source_key: str) -> pd.DataFrame:
                 "final_deck_size": e.get("final_deck_size", 0),
             }
 
+    ancients = _ancient_relics_per_run(source_key)
     rows = []
     for rid, s in summaries.items():
         try:
@@ -642,6 +785,7 @@ def load_run_summaries(source_key: str) -> pd.DataFrame:
             "won": s["run_won"],
             "final_floor": s["final_floor"],
             "final_deck_size": s["final_deck_size"],
+            "ancient_relics": ancients.get(rid, []),
         })
     return pd.DataFrame(rows).sort_values("run_id", ascending=False).reset_index(drop=True)
 
@@ -696,7 +840,7 @@ ANCIENT_ORDER = [
 def load_ancient_encounters(source_key: str) -> list:
     """One row per ancient encounter: {run_id, character, ancient_id, act_idx (0-based), won}."""
     out = []
-    for run_id, data in _get_runs_raw().items():
+    for run_id, data in _get_runs_raw(source_key).items():
         won = data.get("win", False)
         char = data["players"][0]["character"]
         for act_idx, act in enumerate(data.get("map_point_history", [])):
@@ -933,7 +1077,26 @@ st.markdown(
     .rr-meta   { flex: 1; opacity: 0.85; display: flex; gap: 12px; align-items: center; }
     .rr-meta .rr-sep { opacity: 0.3; }
     .rr-meta small { opacity: 0.7; }
+    .rr-relics { display: flex; gap: 3px; align-items: center; }
+    .rr-relic-icon { height: 22px; width: 22px; object-fit: contain; border-radius: 3px; }
     .rr-date   { width: 130px; text-align: right; opacity: 0.65; font-size: 0.85rem; }
+    .relic-tip { position: relative; display: inline-flex; }
+    .relic-tip:hover::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        bottom: 115%;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #1e1e1e;
+        color: white;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        white-space: nowrap;
+        z-index: 100;
+        border: 1px solid rgba(255,255,255,0.2);
+        pointer-events: none;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -956,6 +1119,21 @@ for run in view_page.itertuples(index=False):
     result_label = "WIN" if run.won else "LOSS"
     result_color = WIN_COLOR if run.won else LOSS_COLOR
 
+    relic_imgs = []
+    for relic_id in run.ancient_relics:
+        uri = relic_icon_uri(relic_id, character=run.character)
+        if not uri:
+            continue
+        label = relic_id.removeprefix("RELIC.").replace("_", " ").title()
+        relic_imgs.append(
+            f'<span class="relic-tip" data-tooltip="{label}">'
+            f'<img src="{uri}" class="rr-relic-icon" alt="{label}"></span>'
+        )
+    relics_html = (
+        f'<span class="rr-sep">|</span><div class="rr-relics">{"".join(relic_imgs)}</div>'
+        if relic_imgs else ""
+    )
+
     card_html = (
         f'<div class="run-row {result_class}">'
         f'<div class="rr-result" style="color:{result_color}">{result_label}</div>'
@@ -968,6 +1146,7 @@ for run in view_page.itertuples(index=False):
         f'<small><span style="display:inline-block;min-width:4.5em">Floor {run.final_floor}</span>{"👑" if run.won else "💀"}</small>'
         f'<span class="rr-sep">|</span>'
         f'<small>{run.final_deck_size} card deck</small>'
+        f'{relics_html}'
         f'</div>'
         f'<div class="rr-date">{run.date}</div>'
         f'</div>'

@@ -117,6 +117,7 @@ def load_run_detail_from_data(data: dict, run_id: str) -> dict:
         "win": data.get("win", False),
         "acts": acts,
         "deck": data["players"][0].get("deck", []),
+        "relics": data["players"][0].get("relics", []),
     }
 
 
