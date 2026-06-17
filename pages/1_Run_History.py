@@ -739,7 +739,7 @@ def load_run_summaries(source_key: str) -> pd.DataFrame:
     """
     columns = [
         "run_id", "date", "character", "ascension", "act1_variant",
-        "won", "final_floor", "final_deck_size", "ancient_relics",
+        "won", "was_abandoned", "final_floor", "final_deck_size", "ancient_relics",
     ]
     runs_raw = _get_runs_raw(source_key)
     if not runs_raw:
@@ -774,6 +774,7 @@ def load_run_summaries(source_key: str) -> pd.DataFrame:
             "ascension": data.get("ascension", 0),
             "act1_variant": raw_acts[0].removeprefix("ACT.").title() if raw_acts else "—",
             "won": data.get("win", False),
+            "was_abandoned": data.get("was_abandoned", False),
             "final_floor": floor_count,
             "final_deck_size": len(data["players"][0].get("deck", [])),
             "ancient_relics": relics,
@@ -1132,9 +1133,24 @@ all_chars = sorted(df["character"].unique())
 # Title slot rendered first (visually on top)
 title_slot = st.empty()
 
-selected_char = st.segmented_control("Character", ["All"] + all_chars, default="All")
-if selected_char is None:
-    selected_char = "All"
+char_col, omit_col = st.columns([3, 1])
+with char_col:
+    selected_char = st.segmented_control("Character", ["All"] + all_chars, default="All")
+    if selected_char is None:
+        selected_char = "All"
+with omit_col:
+    omit_abandoned = st.toggle(
+        "Omit abandoned runs",
+        value=False,
+        key="omit_abandoned",
+        help="Filter out runs you quit before dying. Affects the streak indicator, "
+        "overview stats, and the row list. Lifetime stats still come from "
+        "`progress.save` and include abandons.",
+    )
+
+abandoned_count = int(df["was_abandoned"].sum())
+if omit_abandoned:
+    df = df[~df["was_abandoned"]].reset_index(drop=True)
 
 with title_slot.container():
     title_col, streak_col = st.columns([3, 2])
@@ -1226,14 +1242,17 @@ st.markdown(
 
 PAGE_SIZE = 25
 total = len(view)
+abandoned_suffix = (
+    f" · **{abandoned_count}** abandoned hidden" if omit_abandoned and abandoned_count else ""
+)
 if total > PAGE_SIZE:
     page = st.number_input("Page", 1, (total + PAGE_SIZE - 1) // PAGE_SIZE, 1, key="rh_page")
     start = (page - 1) * PAGE_SIZE
     view_page = view.iloc[start:start + PAGE_SIZE].reset_index(drop=True)
-    st.caption(f"Showing {start + 1}–{start + len(view_page)} of {total} runs")
+    st.caption(f"Showing {start + 1}–{start + len(view_page)} of {total} runs{abandoned_suffix}")
 else:
     view_page = view
-    st.caption(f"Showing {total} of {total} runs")
+    st.caption(f"Showing {total} of {total} runs{abandoned_suffix}")
 
 for run in view_page.itertuples(index=False):
     char_color = CHARACTER_COLORS.get(run.character, "#cccccc")
